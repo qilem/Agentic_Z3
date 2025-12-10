@@ -1,0 +1,55 @@
+# ============================================================
+# Agentic-Z3 Path Coverage Benchmark
+# Unified Requirements File
+# ============================================================
+
+# ------------------------------------------------------------
+# Core: Agentic-Z3 SMT Solving Framework
+# ------------------------------------------------------------
+
+# Z3 SMT Solver
+z3-solver>=4.12.0
+
+# LLM Integration
+openai>=1.17.1
+
+# Vector Database for Skill Library
+chromadb>=0.4.0
+
+# Configuration & Validation
+pydantic>=2.0
+pydantic-settings>=2.0
+
+# Utilities
+python-dotenv>=1.0.0
+rich>=13.0.0  # For colored terminal output
+
+# ------------------------------------------------------------
+# TestEval: Benchmark Dataset & Evaluation
+# ------------------------------------------------------------
+
+# Google Gemini (alternative LLM)
+google-generativeai>=0.5.2
+
+# Hugging Face Transformers (for local models)
+transformers>=4.39.3
+
+# Data structures
+sortedcontainers
+
+# Testing & Coverage
+pytest>=7.0.0
+pytest-cov>=5.0.0
+
+# ------------------------------------------------------------
+# Benchmark Pipeline
+# ------------------------------------------------------------
+
+# Progress bars
+tqdm>=4.65.0
+
+# HTTP requests (for API calls)
+requests>=2.28.0
+
+# JSON handling
+jsonlines>=3.1.0

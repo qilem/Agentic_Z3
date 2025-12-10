@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+"""
+AutoExe Runner for Path Coverage Benchmark
+
+Uses AutoExe's LLM-powered symbolic execution to generate test cases
+that satisfy target path conditions.
+"""
+
+import os
+import sys
+import json
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+from argparse import ArgumentParser
+from tqdm import tqdm
+from typing import List, Dict, Any, Optional, Tuple
+
+# Add benchmark directory to path first (for our config)
+benchmark_dir = str(Path(__file__).parent.parent)
+if benchmark_dir not in sys.path:
+    sys.path.insert(0, benchmark_dir)
+
+# Import from benchmark config (explicit)
+import importlib.util
+config_path = Path(__file__).parent.parent / "config.py"
+spec = importlib.util.spec_from_file_location("benchmark_config", config_path)
+benchmark_config = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(benchmark_config)
+
+# Get config values
+LEETCODE_DATA = benchmark_config.LEETCODE_DATA
+TARGET_PATHS_DATA = benchmark_config.TARGET_PATHS_DATA
+SELECTED_TASKS_FILE = benchmark_config.SELECTED_TASKS_FILE
+RESULTS_DIR = benchmark_config.RESULTS_DIR
+AUTOEXE_EXECUTOR = benchmark_config.AUTOEXE_EXECUTOR
+DEFAULT_MODEL = benchmark_config.DEFAULT_MODEL
+get_output_filename = benchmark_config.get_output_filename
+
+# Import adapters
+adapters_dir = str(Path(__file__).parent.parent / "adapters")
+if adapters_dir not in sys.path:
+    sys.path.insert(0, adapters_dir)
+
+from path_to_precondition import (
+    create_autoexe_wrapper,
+    create_simple_constraint_program,
+    path_conditions_to_assertion,
+)
+
+
+def read_jsonl(path: Path) -> List[Dict[str, Any]]:
+    """Read a JSONL file."""
+    data = []
+    with open(path, 'r') as f:
+        for line in f:
+            data.append(json.loads(line))
+    return data
+
+
+def write_jsonl(data: List[Dict[str, Any]], path: Path):
+    """Write data to JSONL file."""
+    with open(path, 'w') as f:
+        for item in data:
+            f.write(json.dumps(item) + '\n')
+
+
+class AutoExeRunner:
+    """Runner for AutoExe approach."""
+    
+    def __init__(
+        self,
+        model: str = DEFAULT_MODEL,
+        executor_path: Path = AUTOEXE_EXECUTOR,
+        timeout: int = 120,
+        use_baseline: bool = False
+    ):
+        """
+        Initialize AutoExe runner.
+        
+        Args:
+            model: LLM model to use (format: "openapi::model-name" or local)
+            executor_path: Path to AutoExe executor binary
+            timeout: Timeout per execution in seconds
+            use_baseline: If True, use --skip-slice (baseline mode)
+        """
+        self.model = model
+        self.executor_path = executor_path
+        self.timeout = timeout
+        self.use_baseline = use_baseline
+        
+        # Check if executor exists
+        if not executor_path.exists():
+            print(f"Warning: AutoExe executor not found at {executor_path}")
+            print("AutoExe runs will be simulated.")
+            self.executor_available = False
+        else:
+            self.executor_available = True
+    
+    def _format_model_name(self, model: str) -> str:
+        """Format model name for AutoExe."""
+        # AutoExe uses namespaced model names
+        if "::" in model:
+            return model
+        # Assume OpenAI for common models
+        if model.startswith("gpt-"):
+            return f"openapi::{model}"
+        return model
+    
+    def _run_autoexe(
+        self,
+        source_file: Path,
+        source_dir: Path,
+        output_file: Path
+    ) -> Tuple[str, float]:
+        """
+        Run AutoExe on a source file.
+        
+        Returns:
+            Tuple of (result_status, elapsed_time)
+        """
+        if not self.executor_available:
+            return "skipped", 0.0
+        
+        model_arg = self._format_model_name(self.model)
+        
+        cmd = [
+            str(self.executor_path),
+            str(source_dir),
+            str(source_file),
+            "--auto-entry",
+            "--output", str(output_file),
+            "--model", model_arg
+        ]
+        
+        if self.use_baseline:
+            cmd.append("--skip-slice")
+        
+        start_time = time.time()
+        
+        try:
+            result = subprocess.run(
+                cmd,
+                timeout=self.timeout,
+                capture_output=True,
+                text=True
+            )
+            elapsed = time.time() - start_time
+            
+            # Read result from output file
+            if output_file.exists():
+                with open(output_file, 'r') as f:
+                    content = f.read().strip()
+                    lines = content.split('\n')
+                    if lines:
+                        status = lines[0].lower()
+                        return status, elapsed
+            
+            return "unknown", elapsed
+            
+        except subprocess.TimeoutExpired:
+            return "timeout", self.timeout
+        except Exception as e:
+            print(f"AutoExe error: {e}")
+            return "error", 0.0
+    
+    def _generate_test_from_result(
+        self,
+        func_name: str,
+        result_status: str,
+        constraint_vars: Dict[str, Any]
+    ) -> str:
+        """
+        Generate a test case from AutoExe result.
+        
+        This is a simplified version - real implementation would parse
+        AutoExe's output for concrete values.
+        """
+        if result_status in ["sat", "success"]:
+            # Generate test with placeholder values
+            # In real usage, these would come from AutoExe's model
+            return f'''def test_{func_name}():
+    solution = Solution()
+    # Generated by AutoExe (status: {result_status})
+    # TODO: Extract actual values from AutoExe output
+    result = solution.{func_name}()
+    # Assertion placeholder
+'''
+        else:
+            return f'''def test_{func_name}():
+    solution = Solution()
+    # AutoExe status: {result_status}
+    # Could not find satisfying input
+    pass
+'''
+    
+    def run_task(
+        self,
+        task_data: Dict[str, Any],
+        paths_data: Dict[str, Any],
+        temp_dir: Path
+    ) -> Dict[str, Any]:
+        """
+        Run AutoExe test generation for a single task.
+        """
+        func_name = task_data['func_name']
+        code = task_data['python_solution']
+        difficulty = task_data['difficulty']
+        task_num = task_data['task_num']
+        task_title = task_data.get('task_title', '')
+        
+        condition_paths = paths_data.get('sampled_condition_paths', [])
+        
+        generated_tests = []
+        
+        for path_idx, condition_path in enumerate(condition_paths):
+            # Create wrapper program for AutoExe
+            wrapper = create_autoexe_wrapper(task_data, condition_path)
+            
+            # Write to temp file
+            source_file = temp_dir / f"task_{task_num}_path_{path_idx}.py"
+            output_file = temp_dir / f"result_{task_num}_path_{path_idx}.txt"
+            
+            with open(source_file, 'w') as f:
+                f.write(wrapper.code)
+            
+            # Run AutoExe
+            status, elapsed = self._run_autoexe(
+                source_file, temp_dir, output_file
+            )
+            
+            # Generate test from result
+            test = self._generate_test_from_result(
+                func_name, status, {}
+            )
+            generated_tests.append(test)
+            
+            print(f"  Path {path_idx + 1}/{len(condition_paths)}: {status} ({elapsed:.1f}s)")
+        
+        return {
+            'task_num': task_num,
+            'task_title': task_title,
+            'func_name': func_name,
+            'difficulty': difficulty,
+            'code': code,
+            'tests': generated_tests
+        }
+    
+    def run_selected_tasks(
+        self,
+        output_path: Optional[Path] = None,
+        save_progress: bool = True
+    ) -> List[Dict[str, Any]]:
+        """
+        Run AutoExe on all selected tasks.
+        """
+        # Load selection
+        with open(SELECTED_TASKS_FILE, 'r') as f:
+            selection = json.load(f)
+        
+        # Load datasets
+        leetcode_data = read_jsonl(LEETCODE_DATA)
+        paths_data = read_jsonl(TARGET_PATHS_DATA)
+        
+        # Get output path
+        approach = "autoexe_baseline" if self.use_baseline else "autoexe"
+        if output_path is None:
+            output_path = RESULTS_DIR / get_output_filename(approach, self.model)
+        
+        # Load existing progress
+        results = []
+        completed_indices = set()
+        
+        if output_path.exists():
+            existing = read_jsonl(output_path)
+            results = existing
+            completed_indices = {r['task_num'] for r in existing}
+            print(f"Resuming from {len(existing)} completed tasks")
+        
+        # Create temp directory
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            
+            # Process each selected task
+            all_indices = selection['all_indices']
+            
+            for idx in tqdm(all_indices, desc="AutoExe generation"):
+                task_data = leetcode_data[idx]
+                task_paths = paths_data[idx]
+                
+                # Skip if already completed
+                if task_data['task_num'] in completed_indices:
+                    continue
+                
+                print(f"\nTask {task_data['task_num']}: {task_data['task_title']}")
+                
+                result = self.run_task(task_data, task_paths, temp_path)
+                results.append(result)
+                
+                # Save progress
+                if save_progress:
+                    write_jsonl(results, output_path)
+        
+        # Final save
+        write_jsonl(results, output_path)
+        print(f"\nResults saved to {output_path}")
+        
+        return results
+
+
+class AutoExeLLMRunner:
+    """
+    Alternative AutoExe runner using LLM for constraint solving.
+    
+    This approach uses the same prompting strategy as AutoExe's
+    LLM-based symbolic execution but without the actual executor.
+    Good for when AutoExe binary is not available.
+    """
+    
+    def __init__(
+        self,
+        model: str = DEFAULT_MODEL,
+        api_key: Optional[str] = None
+    ):
+        self.model = model
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self._client = None
+    
+    @property
+    def client(self):
+        """Lazy load OpenAI client."""
+        if self._client is None:
+            try:
+                from openai import OpenAI
+                self._client = OpenAI(api_key=self.api_key)
+            except ImportError:
+                raise ImportError("openai package required for LLM mode")
+        return self._client
+    
+    def _build_autoexe_prompt(
+        self,
+        code: str,
+        func_name: str,
+        description: str,
+        path_conditions: List[str]
+    ) -> str:
+        """Build a prompt mimicking AutoExe's approach."""
+        path_desc = '\n'.join(f"  {i+1}. {c}" for i, c in enumerate(path_conditions))
+        
+        return f"""You are a symbolic execution engine. Your task is to find concrete input values that will cause the following Python function to execute through a specific path.
+
+Function: {func_name}
+Description: {description}
+
+Code:
+```python
+{code}
+```
+
+Target execution path (the conditions that must be satisfied in order):
+{path_desc}
+
+Analyze the path conditions and find concrete input values that will satisfy ALL conditions.
+Then generate a test case.
+
+Your response should be a Python test function:
+def test_{func_name}():
+    solution = Solution()
+    # Explain your reasoning in comments
+    result = solution.{func_name}(...)  # Fill in actual values
+"""
+    
+    def generate_test(
+        self,
+        code: str,
+        func_name: str,
+        description: str,
+        path_conditions: List[str]
+    ) -> str:
+        """Generate test using LLM."""
+        prompt = self._build_autoexe_prompt(
+            code, func_name, description, path_conditions
+        )
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a precise symbolic execution engine that finds inputs to satisfy path conditions."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.0,
+                max_tokens=512
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            return f"# Error: {e}"
+    
+    def run_task(
+        self,
+        task_data: Dict[str, Any],
+        paths_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Run LLM-based test generation for a single task."""
+        func_name = task_data['func_name']
+        code = task_data['python_solution']
+        description = task_data['description']
+        difficulty = task_data['difficulty']
+        task_num = task_data['task_num']
+        task_title = task_data.get('task_title', '')
+        
+        condition_paths = paths_data.get('sampled_condition_paths', [])
+        
+        generated_tests = []
+        
+        for path_idx, condition_path in enumerate(condition_paths):
+            test = self.generate_test(
+                code, func_name, description, condition_path
+            )
+            generated_tests.append(test)
+            print(f"  Path {path_idx + 1}/{len(condition_paths)}: Generated")
+        
+        return {
+            'task_num': task_num,
+            'task_title': task_title,
+            'func_name': func_name,
+            'difficulty': difficulty,
+            'code': code,
+            'tests': generated_tests
+        }
+    
+    def run_selected_tasks(
+        self,
+        output_path: Optional[Path] = None,
+        save_progress: bool = True
+    ) -> List[Dict[str, Any]]:
+        """Run on all selected tasks."""
+        with open(SELECTED_TASKS_FILE, 'r') as f:
+            selection = json.load(f)
+        
+        leetcode_data = read_jsonl(LEETCODE_DATA)
+        paths_data = read_jsonl(TARGET_PATHS_DATA)
+        
+        if output_path is None:
+            output_path = RESULTS_DIR / get_output_filename("autoexe_llm", self.model)
+        
+        results = []
+        completed_indices = set()
+        
+        if output_path.exists():
+            existing = read_jsonl(output_path)
+            results = existing
+            completed_indices = {r['task_num'] for r in existing}
+        
+        all_indices = selection['all_indices']
+        
+        for idx in tqdm(all_indices, desc="AutoExe LLM generation"):
+            task_data = leetcode_data[idx]
+            task_paths = paths_data[idx]
+            
+            if task_data['task_num'] in completed_indices:
+                continue
+            
+            print(f"\nTask {task_data['task_num']}: {task_data['task_title']}")
+            
+            result = self.run_task(task_data, task_paths)
+            results.append(result)
+            
+            if save_progress:
+                write_jsonl(results, output_path)
+        
+        write_jsonl(results, output_path)
+        print(f"\nResults saved to {output_path}")
+        
+        return results
+
+
+def parse_args():
+    """Parse command line arguments."""
+    parser = ArgumentParser(description="AutoExe runner for path coverage")
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL,
+                        help=f"Model to use (default: {DEFAULT_MODEL})")
+    parser.add_argument("--baseline", action="store_true",
+                        help="Use baseline mode (--skip-slice)")
+    parser.add_argument("--llm-mode", action="store_true",
+                        help="Use LLM-only mode (no AutoExe binary)")
+    parser.add_argument("--timeout", type=int, default=120,
+                        help="Timeout per execution (default: 120s)")
+    parser.add_argument("--output", type=Path, default=None,
+                        help="Output file path")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Show what would be done")
+    return parser.parse_args()
+
+
+def main():
+    """Main entry point."""
+    args = parse_args()
+    
+    print("=" * 60)
+    print("AutoExe Runner")
+    print("=" * 60)
+    print(f"Model: {args.model}")
+    print(f"Mode: {'LLM-only' if args.llm_mode else 'Binary' + (' (baseline)' if args.baseline else '')}")
+    
+    if args.dry_run:
+        print("\nDry run mode - showing configuration")
+        print(f"AutoExe binary: {AUTOEXE_EXECUTOR}")
+        print(f"Binary exists: {AUTOEXE_EXECUTOR.exists()}")
+        return
+    
+    if args.llm_mode:
+        runner = AutoExeLLMRunner(model=args.model)
+    else:
+        runner = AutoExeRunner(
+            model=args.model,
+            timeout=args.timeout,
+            use_baseline=args.baseline
+        )
+    
+    results = runner.run_selected_tasks(output_path=args.output)
+    print(f"\nCompleted: {len(results)} tasks")
+
+
+if __name__ == "__main__":
+    main()
