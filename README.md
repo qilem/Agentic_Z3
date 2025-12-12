@@ -4,11 +4,13 @@
 
 ## Overview
 
-Agentic-Z3 is a multi-agent system that addresses three major pain points of SMT solvers like Z3:
+Agentic-Z3 is a multi-agent framework that uses an LLM + Z3 to solve natural-language SMT-style problems, and also includes a **path-coverage benchmark pipeline** (TestEval) to compare multiple approaches.
 
-1. **Type Error Sensitivity** → Solved by Type-Aware Interactive Probing
-2. **Difficulty in Quantifier Instantiation** → Solved by TTRL with Soft Reset
-3. **Lack of Knowledge Reusability** → Solved by Curriculum-Guided Skill Evolution
+Agentic-Z3 targets three recurring failure modes:
+
+1. **Type error sensitivity** → mitigated via **type-aware interactive probing**
+2. **Stagnation on timeouts / UNKNOWN** → mitigated via **TTRL + soft reset**
+3. **Lack of reuse** → mitigated via **skill crystallization** into a **ChromaDB-backed skill library**
 
 ## Architecture
 
@@ -18,7 +20,7 @@ Agentic-Z3 is a multi-agent system that addresses three major pain points of SMT
 ├─────────────────────────────────────────────────────────────────┤
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
 │  │   Architect  │  │    Worker    │  │    Coach     │          │
-│  │   (Planner)  │  │   (Coder)    │  │ (Diagnostician)│        │
+│  │   (Planner)  │  │   (Coder)    │  │ (Diagnose)   │          │
 │  │              │  │              │  │              │          │
 │  │ • Blueprint  │  │ • Type Probe │  │ • Unsat Core │          │
 │  │ • Curriculum │  │ • Code Gen   │  │   Analysis   │          │
@@ -33,56 +35,23 @@ Agentic-Z3 is a multi-agent system that addresses three major pain points of SMT
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-## Key Mechanisms
-
-### 1. Type-Aware Interactive Probing
-
-Before generating full Z3 code, the Worker creates a minimal "probe" script that verifies variable types are correctly declared. This catches 90% of `TypeError` issues before they cause execution failures.
-
-```python
-# Probe script (generated before full code)
-from z3 import *
-x = Int('x')  # Verify Int declaration works
-y = Real('y')  # Verify Real declaration works
-solver = Solver()
-solver.add(x >= 0)  # Trivial constraint
-print(solver.check())  # Quick validation
-```
-
-### 2. TTRL with Soft Reset
-
-When Z3 returns `UNKNOWN` (timeout) multiple times, instead of just retrying, the system performs a "soft reset":
-
-- **CLEARS** conversation history (forgets failed strategies)
-- **PRESERVES** failure summaries (knows what NOT to do)
-- **BOOSTS** temperature (0.2 → 0.7) for exploration diversity
-
-This prevents the LLM from getting stuck generating similar failing code.
-
-### 3. Curriculum-Guided Skill Evolution
-
-Successful solutions are crystallized into parameterized templates:
-
-```python
-# Original: solver.assert_and_track(x <= 100, "c_bound")
-# Template: solver.assert_and_track(x <= {{UPPER_BOUND}}, "c_bound")
-```
-
-These templates are stored in ChromaDB and retrieved for similar future problems.
-
 ## Installation
 
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-**Dependencies:**
-- `z3-solver>=4.12.0` - The SMT solver
-- `openai>=1.0.0` - LLM API
-- `chromadb>=0.4.0` - Vector database for skill library
-- `pydantic>=2.0` - Configuration management
+### Environment
 
-## Usage
+Agentic-Z3 and the benchmark runners use the OpenAI API by default.
+
+```bash
+export OPENAI_API_KEY="your-key"
+```
+
+You can also configure via a `.env` file (see **Configuration**).
+
+## Quickstart (solve a single problem)
 
 ```bash
 # Direct problem input
@@ -91,103 +60,146 @@ python main.py "Find integers x, y where x + y = 10 and x > y"
 # From file
 python main.py --file problem.txt
 
-# With verbose output
+# From stdin
+cat problem.txt | python main.py --stdin
+```
+
+### Useful CLI flags
+
+```bash
+# Show verbose agent logs (also bumps log level to DEBUG)
 python main.py --verbose "Prove x + y >= x for all non-negative y"
 
-# With custom timeout
-python main.py --timeout 10000 "Complex scheduling problem..."
+# Override Z3 timeout and retry budget
+python main.py --timeout 10000 --max-retries 5 "Complex scheduling problem..."
+
+# JSON logs (helpful for collecting runs)
+python main.py --json-output "..."
+
+# Disable curriculum warmup (useful for speed / benchmarking)
+python main.py --no-warmup "..."
 ```
 
 ## Configuration
 
-Set environment variables or use a `.env` file:
+Configuration is defined in `config.py` (Pydantic Settings). Values can be set via environment variables or a `.env` file.
+
+Common settings:
 
 ```bash
-OPENAI_API_KEY=your-api-key
+OPENAI_API_KEY=...
 LLM_MODEL=gpt-4o
+LLM_TEMPERATURE=0.2
+LLM_MAX_TOKENS=4096
+
 Z3_TIMEOUT=5000
+Z3_PROBE_TIMEOUT=1000
 MAX_TTRL_RETRIES=5
 SOFT_RESET_THRESHOLD=3
+
+CHROMA_PERSIST_PATH=./.agentic_z3_data/chroma_db
+SKILL_RETRIEVAL_TOP_K=3
+
+ENABLE_CURRICULUM_WARMUP=true
+MAX_PLANNING_ITERATIONS=3
+```
+
+## Benchmark: Path Coverage (TestEval)
+
+This repo includes a unified pipeline under `benchmark/` to run and compare:
+
+- **Zero-shot**: direct prompting baseline (`benchmark/runners/zero_shot_runner.py`)
+- **AutoExe**: LLM-powered symbolic execution (`benchmark/runners/autoexe_runner.py`)
+- **Agentic-Z3**: SMT-based solving (full engine or direct Z3) (`benchmark/runners/agentic_z3_runner.py`)
+- **Vanilla Z3**: single “text-to-Z3 script + execute” baseline (`benchmark/runners/vanilla_z3_runner.py`)
+
+### Run the whole pipeline
+
+```bash
+# Run task selection (if needed), all approaches, then evaluate
+python benchmark/run_benchmark.py --all
+```
+
+### Run specific approaches
+
+```bash
+python benchmark/run_benchmark.py --run zero_shot
+python benchmark/run_benchmark.py --run autoexe
+
+# Agentic-Z3 modes:
+# - engine: full multi-agent loop (Architect/Worker/Coach)
+# - direct: direct Z3 solving without the multi-agent engine
+# - llm: LLM-only SMT-style reasoning baseline
+python benchmark/run_benchmark.py --run agentic_z3 --agentic-mode engine
+python benchmark/run_benchmark.py --run agentic_z3 --agentic-mode direct
+python benchmark/run_benchmark.py --run agentic_z3 --agentic-mode llm
+
+python benchmark/run_benchmark.py --run vanilla_z3
+```
+
+### Evaluate existing results
+
+```bash
+python benchmark/run_benchmark.py --evaluate
+
+# Or evaluate with more control
+python benchmark/evaluate.py --list
+python benchmark/evaluate.py --approaches agentic_z3_engine vanilla_z3
+python benchmark/evaluate.py --no-errors
+```
+
+### Results
+
+- Results are written to `benchmark/results/*.jsonl`
+- Evaluation summaries are written to `benchmark/results/summary_*.json`
+- Task selection is stored at `benchmark/selected_tasks.json` (recreate with `python benchmark/run_benchmark.py --select-tasks`)
+
+### Rate limiting (important for benchmarking)
+
+Benchmark runners use `benchmark/rate_limiter.py` for cross-runner throttling and 429 retries.
+If you run runners directly, you can choose an API tier and adjust concurrency:
+
+```bash
+python benchmark/runners/zero_shot_runner.py --rate-limit-tier tier1 --max-workers 2
+python benchmark/runners/vanilla_z3_runner.py --rate-limit-tier tier1 --max-workers 2
+python benchmark/runners/agentic_z3_runner.py --mode engine --rate-limit-tier tier1 --max-workers 2
 ```
 
 ## Project Structure
 
 ```
-Agentic-Z3/
-├── main.py                 # Entry point
-├── config.py               # Configuration (Pydantic Settings)
-├── requirements.txt        # Dependencies
-└── agentic_z3/
-    ├── core/
-    │   ├── state.py        # SMTState shared memory
-    │   └── engine.py       # Main orchestration loop
-    ├── agents/
-    │   ├── base_agent.py   # LLM interaction base
-    │   ├── architect.py    # Hierarchical planning
-    │   ├── worker.py       # Code generation + TTRL
-    │   └── coach.py        # Diagnosis + skill extraction
-    ├── memory/
-    │   ├── skill_library.py # ChromaDB skill storage
-    │   └── ttrl_cache.py   # Soft reset context
-    ├── tools/
-    │   ├── z3_executor.py  # Safe Z3 execution
-    │   └── type_checker.py # Static type analysis
-    └── utils/
-        ├── logger.py       # Structured logging
-        └── prompter.py     # Prompt templates
+agentic_z3/
+  agents/                # Architect / Worker / Coach
+  core/                  # Engine state machine + shared state
+  memory/                # Chroma skill library + TTRL cache
+  tools/                 # Z3 execution, type checking
+  utils/                 # logging, prompting
+
+benchmark/
+  run_benchmark.py       # Orchestrates selection + runs + evaluation
+  evaluate.py            # Unified evaluator for generated tests
+  task_selector.py       # Reproducible selection from TestEval
+  rate_limiter.py        # Thread-safe TPM/RPM limiter with retries
+  adapters/              # Convert TestEval paths → SMT / AutoExe formats
+  runners/               # zero-shot / autoexe / agentic_z3 / vanilla_z3
+  results/               # Output JSONL + summary JSON
+
+TestEval/                # Dataset + prompt templates + evaluator utilities
+AutoExe-Artifact/        # AutoExe executables/artifact (optional for AutoExe runs)
 ```
 
-## Critical Implementation Details
+## Notes / Implementation Details
 
-### assert_and_track Enforcement
+### Unsat-core tracking
 
-All constraints must use `solver.assert_and_track()` instead of `solver.add()` for unsat core tracking to work. The `z3_executor.py` includes a preprocessor that auto-converts if needed:
+Agentic-Z3’s internal Z3 execution path is designed to support unsat-core-driven diagnosis.
+Some baselines (e.g., Vanilla Z3) intentionally avoid any preprocessing that would rewrite
+LLM-generated solver code.
 
-```python
-# LLM generates:
-solver.add(x > 0)
+### Soft reset behavior
 
-# Auto-converted to:
-solver.assert_and_track(x > 0, "c_auto_1")
-```
-
-### Soft Reset Context Preservation
-
-When soft reset clears conversation history, it carefully reconstructs:
-
-1. System prompt (agent role)
-2. Original problem (ground truth)
-3. Failure summary (what NOT to do)
-4. Instruction to try different strategy
-
-## State Machine Flow
-
-```
-INIT → Planning → Probing → Coding → Solving
-                                      ↓
-                    ┌─────────────────┼─────────────────┐
-                    ↓                 ↓                 ↓
-                   SAT              UNSAT            UNKNOWN
-                    ↓                 ↓                 ↓
-              Crystallize        Diagnose          SoftReset?
-                    ↓                 ↓                 ↓
-                  DONE           Re-plan?           Retry
-                                    ↓
-                               ←───────────────────────┘
-```
-
-## References
-
-This system integrates concepts from:
-
-- **BFS-Prover-V2**: Soft Reset mechanism for exploration diversity
-- **LLM-Sym**: Type inference before code generation
-- **LEGO-Prover**: Skill library and template extraction
-- **SolSearch**: Curriculum learning for warmup
-- **AlphaProof**: Interactive probing strategy
+Soft reset clears the agent conversation history to force strategy change, while preserving failure summaries.
 
 ## License
 
 MIT License
-
-
