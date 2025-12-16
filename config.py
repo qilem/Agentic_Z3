@@ -55,12 +55,12 @@ class Settings(BaseSettings):
     # ==========================================================================
     
     OPENAI_API_KEY: Optional[str] = Field(
-        default="",
-        description="OpenAI API key. Required for LLM-based agents."
+        default='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',
+        description="OpenAI API key. Required for LLM-based agents. Set via OPENAI_API_KEY env var or .env file."
     )
     
     LLM_MODEL: str = Field(
-        default="gpt-4o",
+        default="gpt-5.2",
         description="Default LLM model for all agents"
     )
     
@@ -80,6 +80,27 @@ class Settings(BaseSettings):
     )
     
     # ==========================================================================
+    # Agent Conversation History Settings
+    # ==========================================================================
+    
+    AGENT_HISTORY_MODE: str = Field(
+        default="stateful",
+        description="Agent conversation history policy: 'stateful' (full history), "
+                    "'trimmed' (keep last N messages), 'stateless' (no history). "
+                    "Use 'stateless' for benchmark runs to prevent context overflow."
+    )
+    
+    AGENT_MAX_HISTORY_MESSAGES: int = Field(
+        default=40,
+        description="Maximum messages to keep in 'trimmed' history mode (system prompt + last N turns)"
+    )
+    
+    AGENT_MAX_HISTORY_CHARS: int = Field(
+        default=200000,
+        description="Maximum total characters in conversation history (safety guard for all modes)"
+    )
+    
+    # ==========================================================================
     # Memory / Skill Library Settings
     # ==========================================================================
     
@@ -91,6 +112,18 @@ class Settings(BaseSettings):
     SKILL_RETRIEVAL_TOP_K: int = Field(
         default=3,
         description="Number of similar skills to retrieve from the library"
+    )
+    
+    ENABLE_SKILL_LIBRARY: bool = Field(
+        default=True,
+        description="If True, use skill library for retrieval and storage. "
+                    "Disable for benchmark runs to reduce overhead."
+    )
+    
+    ENABLE_SKILL_CRYSTALLIZATION: bool = Field(
+        default=True,
+        description="If True, crystallize successful solutions into skill templates. "
+                    "Disable for benchmark runs to save LLM calls."
     )
     
     # ==========================================================================
@@ -134,5 +167,7 @@ class Settings(BaseSettings):
 
 # Global settings instance - import this in other modules
 settings = Settings()
+
+
 
 

@@ -48,7 +48,7 @@ def execute(test_code,timeout=5):
 
 def parse_args():
     parser = ArgumentParser()
-    parser.add_argument("--path", type=str, default='pathcov_gpt-3.5-turboformat.jsonl')
+    parser.add_argument("--path", type=str, default='pathcov_gpt-5.2format.jsonl')
     return parser.parse_args()
 
 

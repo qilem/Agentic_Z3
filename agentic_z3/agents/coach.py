@@ -181,7 +181,8 @@ class Coach(BaseAgent):
     def crystallize_skill(
         self,
         code: str,
-        blueprint: Optional[PlanBlueprint]
+        blueprint: Optional[PlanBlueprint],
+        use_llm: bool = True
     ) -> Optional[SkillTemplate]:
         """
         Extract a reusable skill template from successful code.
@@ -193,7 +194,7 @@ class Coach(BaseAgent):
         1. Parse the code to identify literal values (numbers, strings)
         2. Replace literals with parameterized placeholders
         3. Extract the constraint pattern structure
-        4. Generate description and applicability tags
+        4. Generate description and applicability tags (optionally via LLM)
         5. Create a SkillTemplate for the library
         
         Example transformation:
@@ -203,6 +204,7 @@ class Coach(BaseAgent):
         Args:
             code: Successful Z3 Python code
             blueprint: Blueprint for context and tagging
+            use_llm: If False, skip LLM call and use heuristic only (faster for benchmarks)
             
         Returns:
             SkillTemplate ready for storage, or None on failure
@@ -215,38 +217,40 @@ class Coach(BaseAgent):
         # Step 1: Parameterize the code
         parameterized_code, parameters = self._parameterize_code(code)
         
-        # Step 2: Use LLM for rich description
-        crystallize_prompt = self.prompt_manager.get_coach_crystallize_prompt(
-            code=code,
-            blueprint=blueprint.raw_json if blueprint else {},
-            problem_type=self._infer_problem_type(blueprint)
-        )
-        
-        try:
-            response = self._call_llm(
-                crystallize_prompt,
-                json_mode=True
+        # Step 2: Use LLM for rich description (if enabled)
+        if use_llm:
+            crystallize_prompt = self.prompt_manager.get_coach_crystallize_prompt(
+                code=code,
+                blueprint=blueprint.raw_json if blueprint else {},
+                problem_type=self._infer_problem_type(blueprint)
             )
             
-            template_data = self._extract_json(response)
-            
-            if template_data:
-                # Create skill template
-                return SkillTemplate(
-                    template_name=template_data.get("template_name", "unnamed_skill"),
-                    description=template_data.get("description", ""),
-                    parameters=parameters or template_data.get("parameters", []),
-                    skeleton_code=parameterized_code,
-                    applicable_patterns=template_data.get("applicable_patterns", [])
+            try:
+                response = self._call_llm(
+                    crystallize_prompt,
+                    json_mode=True,
+                    add_to_history=False  # Don't pollute history with crystallization
                 )
                 
-        except Exception as e:
-            logger.warning(
-                f"LLM crystallization failed, using heuristic: {e}",
-                category=LogCategory.AGENT
-            )
+                template_data = self._extract_json(response)
+                
+                if template_data:
+                    # Create skill template
+                    return SkillTemplate(
+                        template_name=template_data.get("template_name", "unnamed_skill"),
+                        description=template_data.get("description", ""),
+                        parameters=parameters or template_data.get("parameters", []),
+                        skeleton_code=parameterized_code,
+                        applicable_patterns=template_data.get("applicable_patterns", [])
+                    )
+                    
+            except Exception as e:
+                logger.warning(
+                    f"LLM crystallization failed, using heuristic: {e}",
+                    category=LogCategory.AGENT
+                )
         
-        # Fallback: Create basic template
+        # Fallback: Create basic template (heuristic, no LLM)
         return SkillTemplate(
             template_name=f"skill_{hash(code) % 10000}",
             description="Auto-extracted skill template",
@@ -462,5 +466,7 @@ Provide:
             return "arithmetic"
         else:
             return "general"
+
+
 
 

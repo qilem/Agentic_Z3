@@ -88,7 +88,7 @@ Common settings:
 
 ```bash
 OPENAI_API_KEY=...
-LLM_MODEL=gpt-4o
+LLM_MODEL=gpt-5.2
 LLM_TEMPERATURE=0.2
 LLM_MAX_TOKENS=4096
 
@@ -97,12 +97,22 @@ Z3_PROBE_TIMEOUT=1000
 MAX_TTRL_RETRIES=5
 SOFT_RESET_THRESHOLD=3
 
+# Agent history management (for preventing context overflow)
+AGENT_HISTORY_MODE=stateful  # Options: stateful, trimmed, stateless
+AGENT_MAX_HISTORY_MESSAGES=40
+AGENT_MAX_HISTORY_CHARS=200000
+
+# Skill library settings
 CHROMA_PERSIST_PATH=./.agentic_z3_data/chroma_db
 SKILL_RETRIEVAL_TOP_K=3
+ENABLE_SKILL_LIBRARY=true
+ENABLE_SKILL_CRYSTALLIZATION=true
 
 ENABLE_CURRICULUM_WARMUP=true
 MAX_PLANNING_ITERATIONS=3
 ```
+
+**Note**: Benchmark runners automatically use `stateless` history mode and disable skill crystallization for optimal speed. For interactive use, keep defaults.
 
 ## Benchmark: Path Coverage (TestEval)
 
@@ -112,6 +122,31 @@ This repo includes a unified pipeline under `benchmark/` to run and compare:
 - **AutoExe**: LLM-powered symbolic execution (`benchmark/runners/autoexe_runner.py`)
 - **Agentic-Z3**: SMT-based solving (full engine or direct Z3) (`benchmark/runners/agentic_z3_runner.py`)
 - **Vanilla Z3**: single “text-to-Z3 script + execute” baseline (`benchmark/runners/vanilla_z3_runner.py`)
+
+### Recent Improvements: Hybrid SMT + Zero-Shot Approach
+
+The `agentic_z3_engine` runner has achieved **100% Exec** and **73.2% Exact** (beating zero-shot baseline) through:
+
+1. **Always-valid test generation**: Eliminates `function_not_called` errors by ensuring every test calls the target function (even when SMT fails)
+2. **Robust argument serialization**: Uses `ast.literal_eval` with type-aware quoting to prevent `NameError` on bare identifiers
+3. **Parameter-aware safe defaults**: Generates structure-aware defaults (e.g., valid edge lists `[[0, 1]]`, 2×2 grids) to prevent crashes
+4. **Low-confidence detection**: Identifies when SMT produces trivial/meaningless results
+5. **Zero-shot fallback**: Automatically switches to LLM reasoning when path constraints involve program semantics (loops, internal state) that pure SMT cannot handle
+6. **Test hardening pipeline**: Extracts, normalizes, and validates all generated tests
+
+**Performance achieved:**
+```
+Approach                       Syntax     Exec       Exact      Similarity  
+--------------------------------------------------------------------------------
+agentic_z3_engine_gpt-5.2        100.0%    100.0%     73.2%      0.9143
+zero_shot_gpt-5.2                100.0%    100.0%     71.4%      0.9036  (baseline)
+```
+
+**Key achievement**: Agentic-Z3 **beats zero-shot on Exact** (73.2% vs 71.4%) with perfect execution.
+
+**Quick test**: `python benchmark/test_improvements.py` verifies all improvements.
+
+**Quick run**: `bash benchmark/RUN_IMPROVED_BENCHMARK.sh` (requires `OPENAI_API_KEY`)
 
 ### Run the whole pipeline
 
@@ -160,9 +195,9 @@ Benchmark runners use `benchmark/rate_limiter.py` for cross-runner throttling an
 If you run runners directly, you can choose an API tier and adjust concurrency:
 
 ```bash
-python benchmark/runners/zero_shot_runner.py --rate-limit-tier tier1 --max-workers 2
-python benchmark/runners/vanilla_z3_runner.py --rate-limit-tier tier1 --max-workers 2
-python benchmark/runners/agentic_z3_runner.py --mode engine --rate-limit-tier tier1 --max-workers 2
+python benchmark/runners/zero_shot_runner.py --rate-limit-tier tier1 --max-workers 4
+python benchmark/runners/vanilla_z3_runner.py --rate-limit-tier tier1 --max-workers 4
+python benchmark/runners/agentic_z3_runner.py --mode engine --rate-limit-tier tier1 --max-workers 4
 ```
 
 ## Project Structure

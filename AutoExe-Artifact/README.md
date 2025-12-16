@@ -41,9 +41,9 @@ Optional arguments:
   --entry-point       Name of the function that serves as the entry point [nargs=0..1] [default: "entry"]
   --auto-entry        Automatically select the last function as the entry point
   --trace-file        Use an existing trace file
-  --model             Name of the LLM model to be used. Defaults to using local Ollama instances, but supports openapi:: and deepinfra:: namespacing too. [nargs=0..1] [default: "openapi::gpt-4o-mini"]
+  --model             Name of the LLM model to be used. Defaults to using local Ollama instances, but supports openapi:: and deepinfra:: namespacing too. [nargs=0..1] [default: "openapi::gpt-5.2"]
   --server-url        URL of the LLM server to use. Defaults to http://localhost:11434/v1 for local model, https://api.openai.com/v1 for OpenAI, and https://api.deepinfra.com/v1/openai for DeepInfra. [nargs=0..1] [default: ""]
   --output            Output file for results
   --result-output     Output JSON file for query text and results
 ```
-The recommended usage is to use `--auto-entry --model "Your model name"`. Passing `--skip-slice` skip the partition step and act as the baseline in the paper. The program by default will try to connect to `http://localhost:11434/v1` and expects an OpenAI compatible API server here (the default listening port for `ollama`), and you can use `--server-url` to modify the server URL. Furthermore, `--model` supports namespaces (for example, `openai::gpt-4o-mini` will try to connect to OpenAI API, while `deepinfra::gpt-4o-mini` will try to connect to DeepInfra API).
+The recommended usage is to use `--auto-entry --model "Your model name"`. Passing `--skip-slice` skip the partition step and act as the baseline in the paper. The program by default will try to connect to `http://localhost:11434/v1` and expects an OpenAI compatible API server here (the default listening port for `ollama`), and you can use `--server-url` to modify the server URL. Furthermore, `--model` supports namespaces (for example, `openai::gpt-5.2` will try to connect to OpenAI API, while `deepinfra::gpt-5.2` will try to connect to DeepInfra API).

@@ -133,6 +133,8 @@ class TypeChecker:
         "Bools": r"(\w+(?:\s*,\s*\w+)*)\s*=\s*Bools\s*\(['\"]([^'\"]+)['\"]\)",
         "BitVec": r"(\w+)\s*=\s*BitVec\s*\(['\"](\w+)['\"],\s*(\d+)\)",
         "BitVecs": r"(\w+(?:\s*,\s*\w+)*)\s*=\s*BitVecs\s*\(['\"]([^'\"]+)['\"],\s*(\d+)\)",
+        "String": r"(\w+)\s*=\s*String\s*\(['\"](\w+)['\"]\)",
+        "Strings": r"(\w+(?:\s*,\s*\w+)*)\s*=\s*Strings\s*\(['\"]([^'\"]+)['\"]\)",
     }
     
     # Operations that require type matching
@@ -235,8 +237,8 @@ class TypeChecker:
             # Check each type pattern
             for z3_type, pattern in self.TYPE_PATTERNS.items():
                 for match in re.finditer(pattern, line):
-                    if z3_type in ('Int', 'Real', 'Bool'):
-                        # Single variable: x = Int('x')
+                    if z3_type in ('Int', 'Real', 'Bool', 'String'):
+                        # Single variable: x = Int('x'), s = String('s')
                         var_name = match.group(1)
                         report.variables[var_name] = TypeInfo(
                             name=var_name,
@@ -244,10 +246,10 @@ class TypeChecker:
                             line_number=line_num
                         )
                     
-                    elif z3_type in ('Ints', 'Reals', 'Bools'):
+                    elif z3_type in ('Ints', 'Reals', 'Bools', 'Strings'):
                         # Multiple variables: x, y = Ints('x y')
                         var_names = [v.strip() for v in match.group(1).split(',')]
-                        base_type = z3_type[:-1]  # Ints → Int
+                        base_type = z3_type[:-1]  # Ints → Int, Strings → String
                         for var_name in var_names:
                             report.variables[var_name] = TypeInfo(
                                 name=var_name,
@@ -408,5 +410,7 @@ class TypeChecker:
         
         # Default to Int for unknown
         return 'Int'
+
+
 
 

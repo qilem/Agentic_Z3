@@ -109,6 +109,87 @@ class Worker(BaseAgent):
         """Return the Worker's system prompt emphasizing assert_and_track."""
         return self.prompt_manager.get_worker_system_prompt()
     
+    def _build_probe_code(self, variables: list[dict]) -> str:
+        """
+        Deterministically build probe code from blueprint variables.
+        
+        This replaces the LLM-based probe generation with a fast, deterministic
+        approach that constructs valid Z3 code directly from the variable specs.
+        
+        Args:
+            variables: List of variable definitions from blueprint
+                       Each has 'name' and 'type' keys
+        
+        Returns:
+            Executable Z3 probe script
+        """
+        lines = [
+            "from z3 import *",
+            "",
+            "# Variable declarations",
+        ]
+        
+        # Type mapping for Z3 declarations
+        type_map = {
+            "Int": ("Int", "0"),
+            "Real": ("Real", "0.0"),
+            "Bool": ("Bool", "True"),
+            "String": ("String", '""'),
+            # BitVec needs special handling for width
+        }
+        
+        for var in variables:
+            name = var.get("name", "x")
+            var_type = var.get("type", "Int")
+            
+            if var_type.startswith("BitVec"):
+                # Extract bit width: BitVec(32) or BitVec32
+                import re
+                width_match = re.search(r'(\d+)', var_type)
+                width = width_match.group(1) if width_match else "32"
+                lines.append(f"{name} = BitVec('{name}', {width})")
+            elif var_type in type_map:
+                z3_type, _ = type_map[var_type]
+                lines.append(f"{name} = {z3_type}('{name}')")
+            else:
+                # Default to Int for unknown types
+                lines.append(f"{name} = Int('{name}')")
+        
+        lines.extend([
+            "",
+            "# Solver setup",
+            "solver = Solver()",
+            "",
+            "# Trivial constraints to verify types",
+        ])
+        
+        # Add trivial constraints per type
+        for var in variables:
+            name = var.get("name", "x")
+            var_type = var.get("type", "Int")
+            
+            if var_type == "Int":
+                lines.append(f"solver.add({name} >= 0)")
+            elif var_type == "Real":
+                lines.append(f"solver.add({name} >= 0.0)")
+            elif var_type == "Bool":
+                lines.append(f"solver.add(Or({name}, Not({name})))")  # Always true
+            elif var_type == "String":
+                lines.append(f"solver.add(Length({name}) >= 0)")  # Always true
+            elif var_type.startswith("BitVec"):
+                lines.append(f"solver.add({name} >= 0)")  # Unsigned comparison
+            else:
+                lines.append(f"solver.add({name} == {name})")  # Reflexive, always true
+        
+        lines.extend([
+            "",
+            "# Check satisfiability",
+            "result = solver.check()",
+            "print(f'Result: {result}')",
+        ])
+        
+        return "\n".join(lines)
+    
     def interactive_probe(
         self, 
         blueprint: Optional[PlanBlueprint]
@@ -118,21 +199,14 @@ class Worker(BaseAgent):
         
         This is the first phase of the Worker's process. Instead of
         immediately generating full constraint code, we first:
-        1. Generate a minimal script with just variable declarations
+        1. Generate a minimal script with just variable declarations (DETERMINISTIC)
         2. Add trivial constraints to verify type compatibility
         3. Execute against Z3 with a short timeout
         4. Catch type errors BEFORE investing in complex generation
         
-        The probe script looks like:
-        ```python
-        from z3 import *
-        x = Int('x')
-        y = Real('y')
-        solver = Solver()
-        solver.add(x >= 0)  # Trivial constraint to verify type
-        solver.add(y >= 0.0)
-        print(solver.check())
-        ```
+        NOTE: This method now uses DETERMINISTIC probe generation instead of
+        calling the LLM. This saves an LLM round-trip per retry and is faster.
+        The probe code is constructed directly from the blueprint variables.
         
         Args:
             blueprint: The Architect's plan with variable types
@@ -151,23 +225,12 @@ class Worker(BaseAgent):
             category=LogCategory.AGENT
         )
         
-        # Generate probe prompt
-        probe_prompt = self.prompt_manager.get_worker_probe_prompt(
-            variables=blueprint.variables
-        )
-        
         try:
-            # Generate probe code
-            response = self._call_llm(
-                probe_prompt,
-                temperature=0.1,  # Low temp for deterministic probing
-                add_to_history=False  # Don't add to main conversation
-            )
-            
-            probe_code = self._extract_code(response)
+            # Generate probe code DETERMINISTICALLY (no LLM call!)
+            probe_code = self._build_probe_code(blueprint.variables)
             
             logger.debug(
-                f"Probe code:\n{probe_code}",
+                f"Probe code (deterministic):\n{probe_code}",
                 category=LogCategory.AGENT
             )
             
@@ -220,7 +283,8 @@ class Worker(BaseAgent):
         self,
         blueprint: Optional[PlanBlueprint],
         probe_result: ProbeResult,
-        skills: list[SkillTemplate]
+        skills: list[SkillTemplate],
+        failure_context: Optional[str] = None
     ) -> str:
         """
         Generate full Z3 Python code from blueprint.
@@ -230,6 +294,7 @@ class Worker(BaseAgent):
         2. Incorporates relevant skills from the library
         3. Generates all constraints with assert_and_track for tracking
         4. Uses constraint naming that matches blueprint groups
+        5. Learns from previous failures if failure_context is provided
         
         CRITICAL: All constraints must use:
             solver.assert_and_track(constraint, "c_groupname_N")
@@ -243,6 +308,8 @@ class Worker(BaseAgent):
             blueprint: The Architect's structured plan
             probe_result: Verified types from probing phase
             skills: Retrieved skill templates from library
+            failure_context: Optional error info from previous attempt (stderr/traceback)
+                to help the model avoid repeating the same mistake
             
         Returns:
             Complete executable Z3 Python script
@@ -267,6 +334,18 @@ class Worker(BaseAgent):
             "",
             f"Strategy Hint: {blueprint.solving_strategy}",
         ]
+        
+        # CRITICAL: Add failure context if this is a retry
+        # This enables error-driven repair - the model can learn from the traceback
+        if failure_context:
+            prompt_parts.append("")
+            prompt_parts.append("=" * 60)
+            prompt_parts.append("PREVIOUS ATTEMPT FAILED - FIX THE ERROR BELOW:")
+            prompt_parts.append("=" * 60)
+            prompt_parts.append(failure_context[:1500])  # Truncate very long tracebacks
+            prompt_parts.append("")
+            prompt_parts.append("You MUST fix this error. Generate corrected code that avoids this issue.")
+            prompt_parts.append("=" * 60)
         
         # Add skill templates if available
         if skills:
@@ -463,5 +542,7 @@ elif result == unsat:
             f"Temperature reset to {self.temperature}",
             category=LogCategory.AGENT
         )
+
+
 
 

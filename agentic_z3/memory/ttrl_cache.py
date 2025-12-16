@@ -183,54 +183,79 @@ class TTRLCache:
         Check if soft reset should be triggered.
         
         Soft reset is triggered when:
-        1. Consecutive UNKNOWN (timeout) results >= threshold
-        2. OR consecutive ERRORs >= threshold
-        3. OR duplicate code detected multiple times
+        1. Consecutive UNKNOWN (timeout) results >= threshold - 1
+           (we use threshold - 1 so soft reset fires before retries exhaust)
+        2. OR duplicate code detected (even 1 duplicate suggests LLM is stuck)
+        
+        NOTE: We do NOT trigger soft reset for consecutive ERRORs (except in extreme cases)
+        because runtime errors are often fixable via error-driven repair - passing the
+        error message back to the LLM. Soft reset would clear that error context.
+        Only trigger for errors if we have many consecutive (4+) without progress,
+        suggesting the LLM truly cannot fix the error.
         
         Returns:
             True if soft reset should be triggered
         """
         threshold = settings.SOFT_RESET_THRESHOLD
+        # Use threshold - 1 so we trigger soft reset before we run out of retries
+        # e.g., if threshold=3 and max_retries=3, we want to reset after 2 failures
+        effective_threshold = max(2, threshold - 1)
         
-        # Check consecutive failures
-        if self.consecutive_unknowns >= threshold:
+        # Check consecutive timeouts (UNKNOWN) - these indicate structural issues
+        # that need fundamentally different approaches
+        if self.consecutive_unknowns >= effective_threshold:
             logger.info(
                 f"Soft reset trigger: {self.consecutive_unknowns} consecutive timeouts",
                 category=LogCategory.SYSTEM
             )
             return True
         
-        if self.consecutive_errors >= threshold:
-            logger.info(
-                f"Soft reset trigger: {self.consecutive_errors} consecutive errors",
-                category=LogCategory.SYSTEM
-            )
-            return True
+        # For errors, we're much more conservative because error-driven repair
+        # (passing error back to LLM) often works. Only reset after many errors.
+        # Use a higher threshold: at least 4 consecutive errors AND the error
+        # message is the same (stuck in a loop).
+        error_hard_threshold = max(4, threshold + 1)
+        if self.consecutive_errors >= error_hard_threshold:
+            # Check if we're generating the same error repeatedly
+            recent_errors = [a.error for a in self.attempts[-self.consecutive_errors:] 
+                           if a.result == "error" and a.error]
+            if len(recent_errors) >= 2:
+                # Check if errors are similar (first 100 chars match)
+                first_error = recent_errors[0][:100] if recent_errors else ""
+                all_similar = all(e[:100] == first_error for e in recent_errors)
+                if all_similar:
+                    logger.info(
+                        f"Soft reset trigger: {self.consecutive_errors} consecutive identical errors",
+                        category=LogCategory.SYSTEM
+                    )
+                    return True
         
-        # Check for too many duplicates
+        # Check for duplicates - even one duplicate suggests LLM is stuck
+        # and needs a reset to explore different strategies
         total_attempts = len(self.attempts)
         unique_hashes = len(self._code_hashes)
-        if total_attempts > 3 and unique_hashes < total_attempts * 0.5:
+        if total_attempts >= 2 and unique_hashes < total_attempts:
             logger.info(
-                f"Soft reset trigger: too many duplicate attempts ({unique_hashes}/{total_attempts})",
+                f"Soft reset trigger: duplicate code detected ({unique_hashes} unique/{total_attempts} total)",
                 category=LogCategory.SYSTEM
             )
             return True
         
         return False
     
-    def get_failure_summary(self, max_attempts: int = 5) -> str:
+    def get_failure_summary(self, max_attempts: int = 5, include_errors: bool = True) -> str:
         """
         Get a compressed summary of failed attempts.
         
         This summary is injected into the LLM prompt after soft reset
         to tell it what NOT to try again. The summary includes:
         - What strategies were tried
-        - What errors occurred
+        - What errors occurred (full error messages if include_errors=True)
         - Patterns in the failures
         
         Args:
             max_attempts: Maximum number of recent attempts to include
+            include_errors: If True, include full error messages (truncated) for debugging
             
         Returns:
             Formatted string summary of failures
@@ -250,6 +275,12 @@ class TTRLCache:
         
         for i, attempt in enumerate(recent, 1):
             lines.append(f"{i}. {attempt.to_summary()}")
+            # Include the actual error message for error-driven repair
+            if include_errors and attempt.error and attempt.result == "error":
+                # Truncate long errors but include enough to be useful
+                error_snippet = attempt.error[:500].strip()
+                if error_snippet:
+                    lines.append(f"   Error: {error_snippet}")
         
         # Add pattern analysis
         unknown_count = sum(1 for a in recent if a.result == "unknown")
@@ -259,6 +290,14 @@ class TTRLCache:
             lines.append(f"\nPattern: {unknown_count} timeouts - try simpler constraints or different triggers")
         if error_count > 0:
             lines.append(f"\nPattern: {error_count} errors - check type compatibility and syntax")
+            # Extract common error patterns
+            error_msgs = [a.error for a in recent if a.result == "error" and a.error]
+            if error_msgs:
+                # Check for common Z3 issues
+                if any("sort mismatch" in e.lower() for e in error_msgs):
+                    lines.append("   Common issue: Z3 sort mismatch - check String/Char types, Int/Real mixing")
+                if any("unknown sort" in e.lower() for e in error_msgs):
+                    lines.append("   Common issue: Unknown sort - ensure proper Z3 imports and type declarations")
         
         return "\n".join(lines)
     
@@ -327,5 +366,7 @@ class TTRLCache:
         normalized = ' '.join(code.split()).lower()
         
         return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+
 
 

@@ -12,7 +12,7 @@ from data_utils import read_jsonl, write_jsonl, add_lineno, add_lineno_comment
 def parse_args():
     parser = ArgumentParser()
     parser.add_argument("--dataset", type=str, default='leetcode')
-    parser.add_argument("--model", type=str, default='gpt-3.5-turbo')
+    parser.add_argument("--model", type=str, default='gpt-5.2')
     
     parser.add_argument("--max_tokens", type=int, default=1024)
     parser.add_argument("--temperature", type=float, default=0)
@@ -27,7 +27,7 @@ def generate_completion(args,prompt,system_message=''):
             {"role": "user", "content": prompt},
         ],
         temperature=args.temperature,
-        max_tokens=args.max_tokens
+        max_completion_tokens=args.max_tokens
     )
     code_output=response.choices[0].message.content
     return code_output
@@ -42,7 +42,7 @@ def generate_twostep(args,prompt_cond, prompt_test,system_message=''):
         model=args.model,
         messages=messages,
         temperature=args.temperature,
-        max_tokens=args.max_tokens
+        max_completion_tokens=args.max_tokens
     )
     cond=response.choices[0].message.content
     print(cond)
@@ -54,7 +54,7 @@ def generate_twostep(args,prompt_cond, prompt_test,system_message=''):
         model=args.model,
         messages=messages,
         temperature=args.temperature,
-        max_tokens=args.max_tokens
+        max_completion_tokens=args.max_tokens
     )
     generated_test=response.choices[0].message.content
     print(generated_test)

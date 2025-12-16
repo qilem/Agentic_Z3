@@ -4,7 +4,7 @@ from math import sqrt
 import tiktoken
 
 
-ENCODING = tiktoken.encoding_for_model("gpt-4o-mini")
+ENCODING = tiktoken.encoding_for_model("gpt-5.2")
 
 
 def average(data):

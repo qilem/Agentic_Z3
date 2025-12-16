@@ -13,7 +13,7 @@ def parse_args():
     parser = ArgumentParser()
     parser.add_argument("--dataset", type=str, default='leetcode')
     parser.add_argument("--lang", type=str, default='python')
-    parser.add_argument("--model", type=str, default='gpt-3.5-turbo', choices=['gpt-3.5-turbo', 'gpt-4', 'gpt-4-turbo', 'gpt-4o'])
+    parser.add_argument("--model", type=str, default='gpt-5.2', choices=['gpt-3.5-turbo', 'gpt-4', 'gpt-4-turbo', 'gpt-4o', 'gpt-5.2'])
     parser.add_argument("--max_tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0)
     return parser.parse_args()
@@ -27,7 +27,7 @@ def generate_completion(args,prompt,system_message=''):
             {"role": "user", "content": prompt},
         ],
         temperature=args.temperature,
-        max_tokens=args.max_tokens
+        max_completion_tokens=args.max_tokens
     )
     code_output=response.choices[0].message.content
     return code_output

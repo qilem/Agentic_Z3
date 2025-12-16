@@ -184,7 +184,7 @@ def eval_correctness(generated_data):
     
 def parse_args():
     parser = ArgumentParser()
-    parser.add_argument("--path", type=str, default='branchcov_gpt-3.5-turbo.jsonl')
+    parser.add_argument("--path", type=str, default='branchcov_gpt-5.2.jsonl')
     return parser.parse_args()
 
 

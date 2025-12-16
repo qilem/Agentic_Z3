@@ -154,7 +154,7 @@ def eval_correctness(generated_data, covmode='branch'):
     
 def parse_args():
     parser = ArgumentParser()
-    parser.add_argument("--path", type=str, default='linecov_gpt-3.5-turbo.jsonl')
+    parser.add_argument("--path", type=str, default='linecov_gpt-5.2.jsonl')
     return parser.parse_args()
 
 

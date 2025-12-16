@@ -84,10 +84,12 @@ OUTPUT FORMAT: You must respond with valid JSON matching this schema:
 }
 
 CRITICAL RULES:
-- Choose types carefully: Int for integers, Real for continuous, Bool for boolean
+- Choose types carefully: Int for integers, Real for continuous, Bool for boolean, String for text
 - Group constraints logically so unsat core analysis can identify conflict sources
 - Consider quantifiers (Forall, Exists) and suggest instantiation strategies
-- Flag potential type coercion issues (Int vs Real mixing)"""
+- Flag potential type coercion issues (Int vs Real mixing)
+- For string-heavy problems, use String type and note that Z3 String has special operations:
+  Length(s), SubString(s, start, len), s.at(i) for character access, Contains, PrefixOf, SuffixOf"""
 
     ARCHITECT_REFINE_TEMPLATE = """Previous attempt failed with diagnosis:
 {diagnosis}
@@ -130,8 +132,59 @@ CRITICAL REQUIREMENTS:
    - Int("x") for integers
    - Real("y") for real numbers
    - Bool("b") for booleans
+   - String("s") for strings
+
+4. **Z3 STRING HANDLING** (CRITICAL - common source of errors):
+   In Z3's Python API, string indexing has a type distinction:
+   - s[i] returns a CHAR (single character sort)
+   - s.at(i) returns a STRING (length-1 substring)
    
-4. **SOLVER SETUP**: Always include unsat core tracking
+   ALWAYS use s.at(i) with StringVal for character comparisons:
+   CORRECT:   s.at(i) == StringVal('.')
+   CORRECT:   s.at(i) != StringVal('e')
+   INCORRECT: s[i] == StringVal('.')  # SORT MISMATCH ERROR!
+   
+   For character operations, prefer SubString for substrings:
+   - SubString(s, start, length) returns a substring
+   - Length(s) returns the length of string s
+
+5. **FORBIDDEN PYTHON STRING METHODS ON Z3 STRINGS** (CRITICAL):
+   Z3 String objects are NOT Python strings. DO NOT USE Python methods:
+   
+   FORBIDDEN (will crash with AttributeError):
+   - s.strip()        # NO! Use: And(Not(PrefixOf(StringVal(' '), s)), Not(SuffixOf(StringVal(' '), s)))
+   - s.replace(a, b)  # NO! Use: Replace(s, a, b)  (Z3 function, not method)
+   - s.isdigit()      # NO! Use: And(StrToCode(s) >= 48, StrToCode(s) <= 57) for single char
+   - s.isalpha()      # NO! Use ASCII range checks with StrToCode()
+   - s.at(i).isdigit()# NO! Use: And(StrToCode(s.at(i)) >= 48, StrToCode(s.at(i)) <= 57)
+   - s.upper(), s.lower(), s.split(), etc.  # ALL FORBIDDEN
+   
+   CORRECT Z3 STRING FUNCTIONS (use these instead):
+   - Replace(s, old, new)       # Replace substring
+   - Contains(s, sub)           # Check if s contains sub
+   - PrefixOf(pre, s)           # Check if s starts with pre
+   - SuffixOf(suf, s)           # Check if s ends with suf
+   - Length(s)                  # String length
+   - SubString(s, offset, len)  # Extract substring
+   - StrToCode(s)               # Convert length-1 string to ASCII code (Int)
+   - StrToInt(s)                # Parse string as integer
+   - IntToStr(n)                # Convert integer to string
+
+6. **DO NOT INDEX PYTHON LISTS WITH Z3 VARIABLES**:
+   Python lists cannot be indexed by Z3 ArithRef variables:
+   INCORRECT: my_list[z3_var]  # TypeError: list indices must be integers
+   
+   If you need symbolic indexing, either:
+   - Use Z3 Array: arr = Array('arr', IntSort(), IntSort()); Select(arr, i)
+   - Or enumerate concrete indices with If/Or chains
+   - Or restructure to avoid symbolic list indexing entirely
+
+7. **CONSTRAINT LABELS MUST BE PLAIN STRING LITERALS**:
+   Labels in assert_and_track must be simple string literals, NOT f-strings with variables:
+   CORRECT:   solver.assert_and_track(x > 0, "c_bound_1")
+   INCORRECT: solver.assert_and_track(x > 0, f"c_bound_{i}")  # Causes duplicate names!
+   
+5. **SOLVER SETUP**: Always include unsat core tracking
    solver = Solver()
    solver.set(unsat_core=True)
 

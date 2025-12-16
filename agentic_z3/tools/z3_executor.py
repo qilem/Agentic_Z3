@@ -190,6 +190,228 @@ class Z3Executor:
         
         return self._execute_in_subprocess(processed_code, timeout)
     
+    def _fix_string_char_mismatch(self, code: str) -> str:
+        """
+        Fix Z3 String/Char sort mismatch errors.
+        
+        In Z3's Python API:
+        - s[i] returns a Char (single character)
+        - s.at(i) returns a String (length-1 substring)
+        - StringVal('x') is a String
+        
+        Comparing s[i] == StringVal('x') causes Z3Exception: sort mismatch
+        
+        This method rewrites such patterns to use s.at(i) == StringVal('x')
+        which is the correct way to do character-at-position comparisons.
+        
+        Args:
+            code: Z3 Python code that may have string indexing issues
+            
+        Returns:
+            Code with s[i] == StringVal patterns fixed to use s.at(i)
+        """
+        # Pattern: variable[index] == StringVal('char') or != StringVal('char')
+        # Capture: var_name[index_expr] op StringVal('char')
+        # Replace with: var_name.at(index_expr) op StringVal('char')
+        
+        # Match patterns like: s[i] == StringVal('x'), s[0] != StringVal('.'), etc.
+        # The pattern handles variable names, index expressions, and both == and !=
+        
+        pattern = r'(\w+)\[([^\]]+)\]\s*(==|!=)\s*(StringVal\s*\([^)]+\))'
+        
+        def replace_with_at(match: re.Match) -> str:
+            var_name = match.group(1)
+            index_expr = match.group(2)
+            operator = match.group(3)
+            string_val = match.group(4)
+            
+            logger.debug(
+                f"Fixing string/char mismatch: {var_name}[{index_expr}] -> {var_name}.at({index_expr})",
+                category=LogCategory.Z3
+            )
+            
+            return f"{var_name}.at({index_expr}) {operator} {string_val}"
+        
+        fixed_code = re.sub(pattern, replace_with_at, code)
+        
+        if fixed_code != code:
+            # Count how many fixes we made
+            fix_count = len(re.findall(pattern, code))
+            logger.info(
+                f"Auto-fixed {fix_count} string/char mismatch(es) (s[i] -> s.at(i))",
+                category=LogCategory.Z3
+            )
+        
+        return fixed_code
+    
+    def _sanitize_invalid_string_methods(self, code: str) -> str:
+        """
+        Rewrite invalid Python string methods on Z3 String objects.
+        
+        LLMs commonly generate code that calls Python string methods on Z3 strings,
+        which crashes with AttributeError. This method rewrites the most common
+        patterns to valid Z3 equivalents.
+        
+        Handles:
+        - s.replace(a, b) -> Replace(s, a, b)
+        - s.strip() -> And(Not(PrefixOf(StringVal(' '), s)), Not(SuffixOf(StringVal(' '), s)))
+        - s.at(i).isdigit() / s[i].isdigit() -> And(StrToCode(s.at(i)) >= 48, StrToCode(s.at(i)) <= 57)
+        - s.at(i).isalpha() / s[i].isalpha() -> Or(And(...uppercase...), And(...lowercase...))
+        
+        Args:
+            code: Z3 Python code that may have invalid string method calls
+            
+        Returns:
+            Code with invalid patterns rewritten to valid Z3 equivalents
+        """
+        original_code = code
+        fix_count = 0
+        
+        # 1. Fix .replace(a, b) -> Replace(s, a, b)
+        # Pattern: var.replace(arg1, arg2)
+        replace_pattern = r'(\w+)\.replace\(([^,]+),\s*([^)]+)\)'
+        
+        def fix_replace(match: re.Match) -> str:
+            var = match.group(1)
+            arg1 = match.group(2).strip()
+            arg2 = match.group(3).strip()
+            return f"Replace({var}, {arg1}, {arg2})"
+        
+        new_code = re.sub(replace_pattern, fix_replace, code)
+        if new_code != code:
+            fix_count += len(re.findall(replace_pattern, code))
+            code = new_code
+        
+        # 2. Fix s == s.strip() or comparisons involving .strip()
+        # This is tricky - we rewrite "var == var.strip()" to no-whitespace constraint
+        # Pattern: var == var.strip() or var.strip() == var
+        strip_eq_pattern1 = r'(\w+)\s*==\s*\1\.strip\(\)'
+        strip_eq_pattern2 = r'(\w+)\.strip\(\)\s*==\s*\1'
+        
+        def fix_strip_eq(match: re.Match) -> str:
+            var = match.group(1)
+            return f"And(Not(PrefixOf(StringVal(\" \"), {var})), Not(SuffixOf(StringVal(\" \"), {var})))"
+        
+        new_code = re.sub(strip_eq_pattern1, fix_strip_eq, code)
+        if new_code != code:
+            fix_count += len(re.findall(strip_eq_pattern1, code))
+            code = new_code
+        
+        new_code = re.sub(strip_eq_pattern2, fix_strip_eq, code)
+        if new_code != code:
+            fix_count += len(re.findall(strip_eq_pattern2, code))
+            code = new_code
+        
+        # 2b. Fix standalone .strip() calls (not in comparison)
+        # Pattern: var.strip() when not already handled
+        standalone_strip_pattern = r'(\w+)\.strip\(\)'
+        # Only replace if it's still there after the comparison fixes
+        if '.strip()' in code:
+            def fix_standalone_strip(match: re.Match) -> str:
+                var = match.group(1)
+                # Can't directly replace standalone strip() meaningfully,
+                # but we can at least prevent the crash by removing it
+                # and logging a warning
+                logger.warning(
+                    f"Removing unsupported .strip() call on {var} - may affect semantics",
+                    category=LogCategory.Z3
+                )
+                return var
+            new_code = re.sub(standalone_strip_pattern, fix_standalone_strip, code)
+            if new_code != code:
+                fix_count += len(re.findall(standalone_strip_pattern, code))
+                code = new_code
+        
+        # 3. Fix .isdigit() on string expressions
+        # Pattern: expr.isdigit() where expr might be s.at(i) or s[i]
+        # s.at(i).isdigit() -> And(StrToCode(s.at(i)) >= 48, StrToCode(s.at(i)) <= 57)
+        isdigit_at_pattern = r'(\w+)\.at\(([^)]+)\)\.isdigit\(\)'
+        
+        def fix_isdigit_at(match: re.Match) -> str:
+            var = match.group(1)
+            idx = match.group(2)
+            return f"And(StrToCode({var}.at({idx})) >= 48, StrToCode({var}.at({idx})) <= 57)"
+        
+        new_code = re.sub(isdigit_at_pattern, fix_isdigit_at, code)
+        if new_code != code:
+            fix_count += len(re.findall(isdigit_at_pattern, code))
+            code = new_code
+        
+        # s[i].isdigit() -> And(StrToCode(s.at(i)) >= 48, StrToCode(s.at(i)) <= 57)
+        isdigit_bracket_pattern = r'(\w+)\[([^\]]+)\]\.isdigit\(\)'
+        
+        def fix_isdigit_bracket(match: re.Match) -> str:
+            var = match.group(1)
+            idx = match.group(2)
+            return f"And(StrToCode({var}.at({idx})) >= 48, StrToCode({var}.at({idx})) <= 57)"
+        
+        new_code = re.sub(isdigit_bracket_pattern, fix_isdigit_bracket, code)
+        if new_code != code:
+            fix_count += len(re.findall(isdigit_bracket_pattern, code))
+            code = new_code
+        
+        # Standalone var.isdigit()
+        isdigit_standalone_pattern = r'(\w+)\.isdigit\(\)'
+        
+        def fix_isdigit_standalone(match: re.Match) -> str:
+            var = match.group(1)
+            return f"And(StrToCode({var}) >= 48, StrToCode({var}) <= 57)"
+        
+        new_code = re.sub(isdigit_standalone_pattern, fix_isdigit_standalone, code)
+        if new_code != code:
+            fix_count += len(re.findall(isdigit_standalone_pattern, code))
+            code = new_code
+        
+        # 4. Fix .isalpha() on string expressions
+        # s.at(i).isalpha() -> Or(And(code >= 65, code <= 90), And(code >= 97, code <= 122))
+        isalpha_at_pattern = r'(\w+)\.at\(([^)]+)\)\.isalpha\(\)'
+        
+        def fix_isalpha_at(match: re.Match) -> str:
+            var = match.group(1)
+            idx = match.group(2)
+            return (f"Or(And(StrToCode({var}.at({idx})) >= 65, StrToCode({var}.at({idx})) <= 90), "
+                    f"And(StrToCode({var}.at({idx})) >= 97, StrToCode({var}.at({idx})) <= 122))")
+        
+        new_code = re.sub(isalpha_at_pattern, fix_isalpha_at, code)
+        if new_code != code:
+            fix_count += len(re.findall(isalpha_at_pattern, code))
+            code = new_code
+        
+        # s[i].isalpha()
+        isalpha_bracket_pattern = r'(\w+)\[([^\]]+)\]\.isalpha\(\)'
+        
+        def fix_isalpha_bracket(match: re.Match) -> str:
+            var = match.group(1)
+            idx = match.group(2)
+            return (f"Or(And(StrToCode({var}.at({idx})) >= 65, StrToCode({var}.at({idx})) <= 90), "
+                    f"And(StrToCode({var}.at({idx})) >= 97, StrToCode({var}.at({idx})) <= 122))")
+        
+        new_code = re.sub(isalpha_bracket_pattern, fix_isalpha_bracket, code)
+        if new_code != code:
+            fix_count += len(re.findall(isalpha_bracket_pattern, code))
+            code = new_code
+        
+        # Standalone var.isalpha()
+        isalpha_standalone_pattern = r'(\w+)\.isalpha\(\)'
+        
+        def fix_isalpha_standalone(match: re.Match) -> str:
+            var = match.group(1)
+            return (f"Or(And(StrToCode({var}) >= 65, StrToCode({var}) <= 90), "
+                    f"And(StrToCode({var}) >= 97, StrToCode({var}) <= 122))")
+        
+        new_code = re.sub(isalpha_standalone_pattern, fix_isalpha_standalone, code)
+        if new_code != code:
+            fix_count += len(re.findall(isalpha_standalone_pattern, code))
+            code = new_code
+        
+        if fix_count > 0:
+            logger.info(
+                f"Auto-sanitized {fix_count} invalid Python string method(s) on Z3 strings",
+                category=LogCategory.Z3
+            )
+        
+        return code
+    
     def preprocess_for_tracking(self, code: str) -> str:
         """
         CRITICAL: Convert solver.add() to solver.assert_and_track().
@@ -206,6 +428,8 @@ class Z3Executor:
         - Generating unique constraint names
         - Preserving multi-line add() calls
         - Detecting duplicate constraint names and renaming
+        - Fixing String/Char sort mismatches (s[i] -> s.at(i))
+        - Sanitizing invalid Python string methods on Z3 strings
         
         Args:
             code: Original Z3 code
@@ -213,6 +437,12 @@ class Z3Executor:
         Returns:
             Code with add() converted to assert_and_track()
         """
+        # First, sanitize invalid Python string methods (isdigit, strip, replace, etc.)
+        code = self._sanitize_invalid_string_methods(code)
+        
+        # Then fix any string/char sort mismatches (s[i] -> s.at(i))
+        code = self._fix_string_char_mismatch(code)
+        
         # Skip if already using assert_and_track
         if "assert_and_track" in code and "solver.add(" not in code:
             logger.debug("Code already uses assert_and_track", category=LogCategory.Z3)
@@ -273,7 +503,133 @@ class Z3Executor:
         # Handle duplicate constraint names in assert_and_track calls
         processed = self._deduplicate_constraint_names(processed)
         
+        # Inject Min/Max helpers if needed
+        processed = self._inject_min_max_helpers(processed)
+        
         return processed
+    
+    def _fix_fstring_labels(self, code: str) -> str:
+        """
+        Replace f-string labels in assert_and_track with unique literal labels.
+        
+        LLMs sometimes generate code like:
+            solver.assert_and_track(x > 0, f"c_bound_{i}")
+        
+        This causes problems because:
+        1. If i is a Z3 variable, it won't work as expected
+        2. Loop iterations create duplicate labels (Z3Exception: named assertion defined twice)
+        
+        This method replaces f-string labels with unique auto-generated literals.
+        
+        Args:
+            code: Z3 Python code that may have f-string labels
+            
+        Returns:
+            Code with f-string labels replaced by unique literals
+        """
+        # Pattern: assert_and_track(..., f"..." or f'...')
+        fstring_label_pattern = r'(assert_and_track\([^,]+,\s*)f(["\'])([^"\']*)\2(\s*\))'
+        
+        counter = [0]
+        
+        def replace_fstring(match: re.Match) -> str:
+            prefix = match.group(1)
+            quote = match.group(2)
+            # original_template = match.group(3)  # e.g., "c_bound_{i}"
+            suffix = match.group(4)
+            counter[0] += 1
+            new_label = f"c_fstring_auto_{counter[0]}"
+            logger.debug(
+                f"Replacing f-string label with '{new_label}'",
+                category=LogCategory.Z3
+            )
+            return f'{prefix}"{new_label}"{suffix}'
+        
+        new_code = re.sub(fstring_label_pattern, replace_fstring, code)
+        
+        if new_code != code:
+            logger.info(
+                f"Replaced {counter[0]} f-string label(s) in assert_and_track with unique literals",
+                category=LogCategory.Z3
+            )
+        
+        return new_code
+    
+    def _inject_min_max_helpers(self, code: str) -> str:
+        """
+        Inject Min/Max helper functions if the code uses them.
+        
+        Z3 Python API doesn't have built-in Min/Max functions for arbitrary
+        argument counts. LLMs often generate code using Min(a, b, c, ...) which
+        causes NameError.
+        
+        This method injects helper definitions at the start of the code.
+        
+        Args:
+            code: Z3 Python code that may use Min/Max
+            
+        Returns:
+            Code with Min/Max helpers injected if needed
+        """
+        needs_min = re.search(r'\bMin\s*\(', code) is not None
+        needs_max = re.search(r'\bMax\s*\(', code) is not None
+        
+        if not needs_min and not needs_max:
+            return code
+        
+        # Build helper code
+        helpers = []
+        
+        if needs_min:
+            helpers.append('''
+# Auto-injected Min helper (Z3 doesn't have built-in Min for arbitrary args)
+def Min(*args):
+    if len(args) == 1 and hasattr(args[0], '__iter__'):
+        args = list(args[0])
+    if len(args) == 0:
+        raise ValueError("Min requires at least one argument")
+    if len(args) == 1:
+        return args[0]
+    result = args[0]
+    for arg in args[1:]:
+        result = If(arg < result, arg, result)
+    return result
+''')
+            logger.info("Injected Min() helper function", category=LogCategory.Z3)
+        
+        if needs_max:
+            helpers.append('''
+# Auto-injected Max helper (Z3 doesn't have built-in Max for arbitrary args)
+def Max(*args):
+    if len(args) == 1 and hasattr(args[0], '__iter__'):
+        args = list(args[0])
+    if len(args) == 0:
+        raise ValueError("Max requires at least one argument")
+    if len(args) == 1:
+        return args[0]
+    result = args[0]
+    for arg in args[1:]:
+        result = If(arg > result, arg, result)
+    return result
+''')
+            logger.info("Injected Max() helper function", category=LogCategory.Z3)
+        
+        # Insert helpers after imports
+        helper_code = '\n'.join(helpers)
+        
+        # Find the best insertion point (after imports, before main code)
+        lines = code.split('\n')
+        insert_idx = 0
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith('import ') or stripped.startswith('from '):
+                insert_idx = i + 1
+            elif stripped and not stripped.startswith('#'):
+                # Found first non-import, non-comment line
+                break
+        
+        lines.insert(insert_idx, helper_code)
+        return '\n'.join(lines)
     
     def _deduplicate_constraint_names(self, code: str) -> str:
         """
@@ -282,6 +638,9 @@ class Z3Executor:
         If the LLM used duplicate names in assert_and_track calls,
         append unique suffixes to make them distinct.
         """
+        # First, fix f-string labels (common source of duplicates in loops)
+        code = self._fix_fstring_labels(code)
+        
         # Find all constraint names
         names = re.findall(r'assert_and_track\([^,]+,\s*["\']([^"\']+)["\']', code)
         
@@ -495,5 +854,7 @@ class Z3Executor:
             stdout=stdout,
             stderr=stderr
         )
+
+
 
 

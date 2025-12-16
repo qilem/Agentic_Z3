@@ -14,7 +14,7 @@ client = OpenAI(
 
 for file in sorted(glob.glob(os.path.join(START, "*.py"))):
     response = client.responses.create(
-        model="gpt-4o-mini",
+        model="gpt-5.2",
         instructions=(
             "You are a code translator that is responsible for translating the input Python code into equivalent Java code. " +
             "Important instructions to follow: " +

@@ -76,7 +76,14 @@ class Engine:
         self,
         z3_timeout: Optional[int] = None,
         max_retries: Optional[int] = None,
-        soft_reset_threshold: Optional[int] = None
+        soft_reset_threshold: Optional[int] = None,
+        model: Optional[str] = None,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
+        enable_curriculum_warmup: Optional[bool] = None,
+        history_mode: Optional[str] = None,
+        enable_skill_crystallization: Optional[bool] = None,
+        enable_skill_library: Optional[bool] = None
     ):
         """
         Initialize the Engine with configuration.
@@ -85,6 +92,13 @@ class Engine:
             z3_timeout: Override Z3 solver timeout (ms)
             max_retries: Override maximum TTRL retries
             soft_reset_threshold: Override soft reset threshold
+            model: Override LLM model for all agents
+            temperature: Override LLM temperature for all agents
+            max_tokens: Override LLM max tokens for all agents
+            enable_curriculum_warmup: Override curriculum warmup (False to disable for benchmark)
+            history_mode: Override agent history mode ('stateful', 'trimmed', 'stateless')
+            enable_skill_crystallization: Override skill crystallization (False to disable for benchmark)
+            enable_skill_library: Override skill library usage (False to disable for benchmark)
         """
         # Configuration with defaults from settings
         self.z3_timeout = z3_timeout or settings.Z3_TIMEOUT
@@ -92,28 +106,146 @@ class Engine:
         self.soft_reset_threshold = soft_reset_threshold or settings.SOFT_RESET_THRESHOLD
         self.max_planning_iterations = settings.MAX_PLANNING_ITERATIONS
         
+        # Curriculum warmup override (None = use settings default)
+        self.enable_curriculum_warmup = enable_curriculum_warmup
+        
+        # Benchmark optimization overrides
+        self.enable_skill_crystallization = (
+            enable_skill_crystallization 
+            if enable_skill_crystallization is not None 
+            else settings.ENABLE_SKILL_CRYSTALLIZATION
+        )
+        self.enable_skill_library = (
+            enable_skill_library
+            if enable_skill_library is not None
+            else settings.ENABLE_SKILL_LIBRARY
+        )
+        
+        # LLM configuration for agents
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.history_mode = history_mode
+        
         # Initialize components
-        self.skill_library = SkillLibrary()
+        self.skill_library = SkillLibrary() if self.enable_skill_library else None
         self.ttrl_cache = TTRLCache()
         self.z3_executor = Z3Executor(default_timeout=self.z3_timeout)
         
-        # Initialize agents
-        self.architect = Architect()
+        # Agent kwargs (only include non-None values)
+        agent_kwargs = {}
+        if model is not None:
+            agent_kwargs['model'] = model
+        if temperature is not None:
+            agent_kwargs['temperature'] = temperature
+        if max_tokens is not None:
+            agent_kwargs['max_tokens'] = max_tokens
+        if history_mode is not None:
+            agent_kwargs['history_mode'] = history_mode
+        
+        # Initialize agents with LLM config
+        self.architect = Architect(**agent_kwargs)
         self.worker = Worker(
             z3_executor=self.z3_executor,
             ttrl_cache=self.ttrl_cache,
-            skill_library=self.skill_library
+            skill_library=self.skill_library,
+            **agent_kwargs
         )
         self.coach = Coach(
             skill_library=self.skill_library,
-            z3_executor=self.z3_executor
+            z3_executor=self.z3_executor,
+            **agent_kwargs
         )
         
         logger.info(
             f"Engine initialized: timeout={self.z3_timeout}ms, "
-            f"max_retries={self.max_retries}, soft_reset_threshold={self.soft_reset_threshold}",
+            f"max_retries={self.max_retries}, soft_reset_threshold={self.soft_reset_threshold}, "
+            f"model={model or 'default'}, temperature={temperature or 'default'}, "
+            f"history_mode={history_mode or 'default'}, skill_crystallization={self.enable_skill_crystallization}, "
+            f"skill_library={self.enable_skill_library}",
             category=LogCategory.SYSTEM
         )
+    
+    def _reset_agents_for_new_problem(self) -> None:
+        """
+        Reset agent conversation histories at the start of a new problem.
+        
+        In stateful mode, this prevents cross-problem history bleed.
+        In stateless/trimmed modes, this is a no-op but ensures clean state.
+        
+        Note: Only resets if history_mode is 'stateful' to allow multi-turn
+        conversations within a single problem. For benchmark runs with
+        stateless mode, conversations are already independent per call.
+        """
+        if self.history_mode == "stateful":
+            logger.debug(
+                "Resetting agent conversations for new problem (stateful mode)",
+                category=LogCategory.SYSTEM
+            )
+            self.architect._reset_conversation()
+            self.worker._reset_conversation()
+            self.coach._reset_conversation()
+    
+    def create_blueprint(self, problem: str) -> Optional[PlanBlueprint]:
+        """
+        Create a blueprint for a problem WITHOUT solving it.
+        
+        This is useful for caching blueprints across multiple related problems
+        (e.g., different paths of the same function in a benchmark).
+        
+        Args:
+            problem: Natural language description of the problem
+            
+        Returns:
+            PlanBlueprint or None if planning fails
+        """
+        logger.info(f"Creating blueprint for: {problem[:100]}...", 
+                    category=LogCategory.SYSTEM)
+        return self.architect.create_blueprint(problem)
+    
+    def solve_with_blueprint(
+        self, 
+        problem: str, 
+        blueprint: PlanBlueprint
+    ) -> SMTState:
+        """
+        Solve a problem using a pre-existing blueprint.
+        
+        This skips the Architect planning phase, which is useful when:
+        - The blueprint was cached from a previous call
+        - Multiple related problems share the same structure (e.g., different paths)
+        - You want to test different TTRL strategies on the same blueprint
+        
+        Args:
+            problem: Natural language description of the problem
+            blueprint: Pre-existing blueprint to use (skips Architect)
+            
+        Returns:
+            Final SMTState with execution results
+        """
+        logger.info(f"Starting solve with cached blueprint for: {problem[:100]}...", 
+                    category=LogCategory.SYSTEM)
+        
+        # Initialize state with the pre-existing blueprint
+        state = SMTState(problem_description=problem)
+        state.plan_blueprint = blueprint
+        self.ttrl_cache.clear_for_new_problem()
+        
+        # Reset agents for new problem (even with cached blueprint)
+        self._reset_agents_for_new_problem()
+        
+        # Skip directly to TTRL loop (no planning phase)
+        state = self._ttrl_loop(state)
+        
+        # Handle results
+        if state.execution_status == ExecutionStatus.SAT:
+            self._crystallize_success(state)
+        elif state.execution_status == ExecutionStatus.UNSAT:
+            # Diagnose but don't re-plan since we're using a cached blueprint
+            diagnosis = self._diagnose_unsat(state)
+            state.diagnosis = diagnosis
+        
+        return state
     
     def solve(self, problem: str) -> SMTState:
         """
@@ -136,6 +268,10 @@ class Engine:
         # Initialize state
         state = SMTState(problem_description=problem)
         self.ttrl_cache.clear_for_new_problem()
+        
+        # Reset agent conversations if in stateful mode (to prevent cross-problem history bleed)
+        # In stateless/trimmed modes, this is a no-op but ensures clean state per problem
+        self._reset_agents_for_new_problem()
         
         # Main planning loop (re-plan on UNSAT diagnosis)
         while state.planning_iterations < self.max_planning_iterations:
@@ -210,7 +346,13 @@ class Engine:
         )
         
         # Check if we should generate warmup curriculum
-        if (settings.ENABLE_CURRICULUM_WARMUP and 
+        # Use instance override if set, otherwise fall back to settings
+        warmup_enabled = (
+            self.enable_curriculum_warmup 
+            if self.enable_curriculum_warmup is not None 
+            else settings.ENABLE_CURRICULUM_WARMUP
+        )
+        if (warmup_enabled and 
             state.planning_iterations == 0 and
             self._is_complex_problem(state.problem_description)):
             self._run_curriculum_warmup(state.problem_description)
@@ -262,22 +404,65 @@ class Engine:
         """
         logger.info("Entering TTRL loop", category=LogCategory.SYSTEM)
         
+        # Track if we need soft reset for next iteration
+        # (checked after recording attempt, applied at start of next iteration)
+        _pending_soft_reset = False
+        
+        # Cache probe result across retries (probe only depends on blueprint,
+        # which doesn't change during retries). This saves LLM calls.
+        _cached_probe_result: Optional[ProbeResult] = None
+        
+        # Cache skill retrieval ONCE per path (not per retry)
+        # Skills depend on problem_description which doesn't change during retries
+        _cached_skills = []
+        if self.enable_skill_library and self.skill_library is not None:
+            _cached_skills = self.skill_library.retrieve(
+                state.problem_description,
+                top_k=settings.SKILL_RETRIEVAL_TOP_K
+            )
+            logger.debug(
+                f"Retrieved {len(_cached_skills)} skills (cached for retries)",
+                category=LogCategory.SYSTEM
+            )
+        else:
+            logger.debug(
+                "Skill library disabled, skipping retrieval",
+                category=LogCategory.SYSTEM
+            )
+        
         while state.retry_count < self.max_retries:
             logger.info(
                 f"TTRL iteration {state.retry_count + 1}/{self.max_retries}",
                 category=LogCategory.SYSTEM
             )
             
-            # Check for soft reset trigger
-            if state.should_trigger_soft_reset(self.soft_reset_threshold):
+            # Apply pending soft reset from previous iteration's failure analysis
+            if _pending_soft_reset:
                 logger.info(
-                    f"Triggering soft reset after {self.soft_reset_threshold} failures",
+                    "Applying soft reset from previous iteration",
                     category=LogCategory.SYSTEM
                 )
                 self.worker.perform_soft_reset(state)
+                self.ttrl_cache.on_soft_reset()
+                _pending_soft_reset = False
             
-            # Step 1: Interactive type probing
-            probe_result = self.worker.interactive_probe(state.plan_blueprint)
+            # Step 1: Interactive type probing (CACHED across retries)
+            # The probe only depends on the blueprint, which doesn't change during retries
+            if _cached_probe_result is None:
+                probe_result = self.worker.interactive_probe(state.plan_blueprint)
+                if probe_result.success:
+                    _cached_probe_result = probe_result
+                    logger.debug(
+                        "Probe result cached for subsequent retries",
+                        category=LogCategory.SYSTEM
+                    )
+            else:
+                probe_result = _cached_probe_result
+                logger.debug(
+                    "Using cached probe result",
+                    category=LogCategory.SYSTEM
+                )
+            
             state.probe_results = probe_result
             
             if not probe_result.success:
@@ -288,20 +473,38 @@ class Engine:
                 state.add_failure_summary(
                     f"Type probe failed: {', '.join(probe_result.errors)}"
                 )
+                # Record probe failure as an attempt for stuck detection
+                self.ttrl_cache.record_attempt(
+                    code="# probe failed",
+                    result="error",
+                    error=", ".join(probe_result.errors)
+                )
+                # Check if we should soft reset on next iteration
+                if self.ttrl_cache.should_trigger_soft_reset():
+                    _pending_soft_reset = True
                 state.reset_for_retry()
                 continue
             
             # Step 2: Generate full Z3 code
-            # Retrieve relevant skills from library
-            skills = self.skill_library.retrieve(
-                state.problem_description,
-                top_k=settings.SKILL_RETRIEVAL_TOP_K
-            )
+            # Use cached skills (retrieved once before the retry loop)
+            skills = _cached_skills
+            
+            # Build failure context for error-driven repair
+            # This helps the LLM avoid repeating the same mistake
+            failure_context = None
+            if state.last_error_message:
+                # Include the last error/traceback so the model can learn from it
+                failure_context = f"Error from previous attempt:\n{state.last_error_message}"
+                # Also include recent failure summaries if available
+                recent_failures = state.get_failure_context(max_summaries=3)
+                if recent_failures and "No previous failures" not in recent_failures:
+                    failure_context += f"\n\nRecent failure history:\n{recent_failures}"
             
             code = self.worker.generate_code(
                 state.plan_blueprint,
                 probe_result,
-                skills
+                skills,
+                failure_context=failure_context
             )
             state.current_code = code
             
@@ -311,23 +514,40 @@ class Engine:
             # Step 3: Execute with Z3
             result = self.z3_executor.run_with_unsat_core_tracking(code)
             
-            # Record in TTRL cache
+            # Record in TTRL cache (prefer full stderr for better error-driven repair)
             self.ttrl_cache.record_attempt(
                 code=code,
                 result=result.status,
-                error=result.error or ""
+                error=result.stderr or result.error or ""
             )
             
             # Update state with results
             state.execution_status = ExecutionStatus[result.status.upper()]
             state.model = result.model
             state.unsat_core_dump = result.unsat_core
-            state.error_message = result.error or ""
+            # Prefer full raw stderr (traceback) when available.
+            # `result.error` may be a truncated summary depending on executor parsing.
+            state.error_message = result.stderr or result.error or ""
             
             logger.info(
                 f"Z3 result: {result.status}",
                 category=LogCategory.Z3
             )
+
+            # If execution errored, surface the full traceback/stderr in logs.
+            # This is the most actionable debugging signal when you see "Z3 result: error".
+            if result.status == "error":
+                if result.stderr:
+                    logger.error(
+                        "Z3 execution failed. Full stderr/traceback:\n"
+                        + result.stderr,
+                        category=LogCategory.Z3,
+                    )
+                elif result.error:
+                    logger.error(
+                        "Z3 execution failed. Error:\n" + result.error,
+                        category=LogCategory.Z3,
+                    )
             
             # Check exit conditions
             if state.execution_status in (ExecutionStatus.SAT, ExecutionStatus.UNSAT):
@@ -343,12 +563,32 @@ class Engine:
                     f"Execution error: {state.error_message[:100]}"
                 )
             
+            # Check if we should trigger soft reset for next iteration
+            # This uses TTRLCache's real "stuck" signals: consecutive errors/unknowns,
+            # duplicate code hashes - more reliable than just retry_count % threshold
+            if self.ttrl_cache.should_trigger_soft_reset():
+                logger.info(
+                    "Soft reset will be triggered next iteration (TTRLCache detected stuck: "
+                    f"consecutive_unknowns={self.ttrl_cache.consecutive_unknowns}, "
+                    f"consecutive_errors={self.ttrl_cache.consecutive_errors})",
+                    category=LogCategory.SYSTEM
+                )
+                _pending_soft_reset = True
+            
+            # Preserve current attempt results before resetting
+            # so we can restore meaningful final status if retries exhaust
+            state.preserve_last_attempt()
             state.reset_for_retry()
         
         logger.warning(
             f"TTRL loop exhausted ({self.max_retries} retries)",
             category=LogCategory.SYSTEM
         )
+        
+        # Restore the last attempt results so we return ERROR/UNKNOWN
+        # instead of PENDING when retries are exhausted
+        state.restore_last_attempt()
+        
         return state
     
     def _diagnose_unsat(self, state: SMTState) -> Optional[DiagnosisReport]:
@@ -392,15 +632,34 @@ class Engine:
         Args:
             state: State with SAT result and successful code
         """
+        # Skip crystallization if disabled (e.g., for benchmark speed)
+        if not self.enable_skill_crystallization:
+            logger.debug(
+                "Skill crystallization disabled, skipping",
+                category=LogCategory.SYSTEM
+            )
+            return
+        
+        # Skip if skill library is disabled
+        if not self.enable_skill_library or self.skill_library is None:
+            logger.debug(
+                "Skill library disabled, skipping crystallization",
+                category=LogCategory.SYSTEM
+            )
+            return
+        
         logger.info(
             "Crystallizing successful solution into skill template",
             category=LogCategory.AGENT
         )
         
         try:
+            # Pass use_llm=False if crystallization is disabled to use heuristic only
+            # This saves LLM calls while still creating basic templates
             template = self.coach.crystallize_skill(
                 state.current_code,
-                state.plan_blueprint
+                state.plan_blueprint,
+                use_llm=self.enable_skill_crystallization
             )
             
             if template:
@@ -522,5 +781,7 @@ class Engine:
             return "theorem_proving"
         else:
             return "arithmetic"
+
+
 
 

@@ -195,13 +195,53 @@ class SMTState:
     # Planning tracking
     planning_iterations: int = 0
     
+    # Last attempt tracking (preserved across resets for final status reporting)
+    # These are populated before reset_for_retry() so we can report meaningful
+    # final status when retries exhaust instead of returning PENDING.
+    last_execution_status: Optional[ExecutionStatus] = None
+    last_error_message: str = ""
+    last_code: str = ""
+    last_unsat_core: list[str] = field(default_factory=list)
+    last_model: Optional[str] = None
+    
+    def preserve_last_attempt(self) -> None:
+        """
+        Preserve current attempt results before reset.
+        
+        This enables meaningful final status reporting when retries exhaust.
+        Called by the Engine before reset_for_retry() to capture the last
+        ERROR/UNKNOWN state so we don't lose it.
+        """
+        self.last_execution_status = self.execution_status
+        self.last_error_message = self.error_message
+        self.last_code = self.current_code
+        self.last_unsat_core = list(self.unsat_core_dump)
+        self.last_model = self.model
+    
+    def restore_last_attempt(self) -> None:
+        """
+        Restore the last attempt results after retries exhaust.
+        
+        Called by the Engine when max retries reached to ensure we return
+        a meaningful status (ERROR/UNKNOWN) instead of PENDING.
+        """
+        if self.last_execution_status is not None:
+            self.execution_status = self.last_execution_status
+            self.error_message = self.last_error_message
+            self.current_code = self.last_code
+            self.unsat_core_dump = self.last_unsat_core
+            self.model = self.last_model
+    
     def reset_for_retry(self) -> None:
         """
         Reset execution-related fields for a new TTRL iteration.
         
-        Keeps: problem_description, plan_blueprint, failure_summaries
+        Keeps: problem_description, plan_blueprint, failure_summaries, last_* fields
         Resets: current_code, execution_status, model, etc.
         Increments: retry_count
+        
+        Note: Call preserve_last_attempt() BEFORE this method if you want
+        to preserve the current results for final status reporting.
         """
         self.current_code = ""
         self.probe_results = None
@@ -217,7 +257,7 @@ class SMTState:
         Reset for a new planning iteration after UNSAT diagnosis.
         
         Keeps: problem_description, failure_summaries
-        Resets: Everything else
+        Resets: Everything else including last_* tracking fields
         Increments: planning_iterations
         """
         self.plan_blueprint = None
@@ -230,6 +270,12 @@ class SMTState:
         self.diagnosis = None
         self.retry_count = 0
         self.planning_iterations += 1
+        # Clear last attempt tracking since we're starting fresh
+        self.last_execution_status = None
+        self.last_error_message = ""
+        self.last_code = ""
+        self.last_unsat_core = []
+        self.last_model = None
     
     def add_failure_summary(self, summary: str) -> None:
         """
@@ -285,7 +331,7 @@ class SMTState:
         Returns a condensed view of the current state without
         the full code or verbose fields.
         """
-        return {
+        summary = {
             "status": self.execution_status.value,
             "retry_count": self.retry_count,
             "planning_iterations": self.planning_iterations,
@@ -295,5 +341,12 @@ class SMTState:
             "unsat_core_size": len(self.unsat_core_dump),
             "failure_count": len(self.failure_summaries),
         }
+        # Include last attempt info if available
+        if self.last_execution_status is not None:
+            summary["last_status"] = self.last_execution_status.value
+            summary["has_last_error"] = bool(self.last_error_message)
+        return summary
+
+
 
 
