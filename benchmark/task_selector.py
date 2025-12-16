@@ -2,8 +2,8 @@
 """
 Task Selector for Path Coverage Benchmark
 
-Selects 15 Medium (difficulty=2) and 15 Hard (difficulty=3) tasks
-from the TestEval dataset for benchmarking.
+Selects Hard (difficulty=3) tasks from the TestEval dataset for benchmarking.
+Default: 15 hard tasks only (configurable via NUM_MEDIUM_TASKS and NUM_HARD_TASKS).
 """
 
 import json
@@ -192,3 +192,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+

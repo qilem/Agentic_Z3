@@ -11,11 +11,15 @@ import sys
 import json
 import subprocess
 import tempfile
+import threading
 import time
+import re
+import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from argparse import ArgumentParser
 from tqdm import tqdm
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 
 # Add benchmark directory to path first (for our config)
 benchmark_dir = str(Path(__file__).parent.parent)
@@ -66,6 +70,18 @@ def write_jsonl(data: List[Dict[str, Any]], path: Path):
             f.write(json.dumps(item) + '\n')
 
 
+def compute_selection_hash(selection: Dict[str, Any]) -> str:
+    """Compute a short hash of the task selection for identification."""
+    task_nums = sorted([t.get('task_num', 0) for t in selection.get('tasks', [])])
+    key = f"{selection.get('seed', 0)}_{task_nums}"
+    return hashlib.md5(key.encode()).hexdigest()[:8]
+
+
+def get_selected_task_nums(selection: Dict[str, Any]) -> Set[int]:
+    """Extract set of task_nums from selection."""
+    return {t.get('task_num') for t in selection.get('tasks', []) if 'task_num' in t}
+
+
 class AutoExeRunner:
     """Runner for AutoExe approach."""
     
@@ -74,7 +90,8 @@ class AutoExeRunner:
         model: str = DEFAULT_MODEL,
         executor_path: Path = AUTOEXE_EXECUTOR,
         timeout: int = 120,
-        use_baseline: bool = False
+        use_baseline: bool = False,
+        max_workers: int = 4
     ):
         """
         Initialize AutoExe runner.
@@ -84,11 +101,13 @@ class AutoExeRunner:
             executor_path: Path to AutoExe executor binary
             timeout: Timeout per execution in seconds
             use_baseline: If True, use --skip-slice (baseline mode)
+            max_workers: Max parallel workers (default: 4)
         """
         self.model = model
         self.executor_path = executor_path
         self.timeout = timeout
         self.use_baseline = use_baseline
+        self.max_workers = max_workers
         
         # Check if executor exists
         if not executor_path.exists():
@@ -112,16 +131,17 @@ class AutoExeRunner:
         self,
         source_file: Path,
         source_dir: Path,
-        output_file: Path
-    ) -> Tuple[str, float]:
+        output_file: Path,
+        result_json_file: Path
+    ) -> Tuple[str, float, Dict[str, Any]]:
         """
         Run AutoExe on a source file.
         
         Returns:
-            Tuple of (result_status, elapsed_time)
+            Tuple of (result_status, elapsed_time, parsed_result_dict)
         """
         if not self.executor_available:
-            return "skipped", 0.0
+            return "skipped", 0.0, {}
         
         model_arg = self._format_model_name(self.model)
         
@@ -131,6 +151,7 @@ class AutoExeRunner:
             str(source_file),
             "--auto-entry",
             "--output", str(output_file),
+            "--result-output", str(result_json_file),  # Get detailed JSON output
             "--model", model_arg
         ]
         
@@ -148,45 +169,189 @@ class AutoExeRunner:
             )
             elapsed = time.time() - start_time
             
-            # Read result from output file
+            status = "unknown"
+            result_data = {}
+            
+            # Read status from output file
             if output_file.exists():
                 with open(output_file, 'r') as f:
                     content = f.read().strip()
                     lines = content.split('\n')
                     if lines:
                         status = lines[0].lower()
-                        return status, elapsed
             
-            return "unknown", elapsed
+            # Read detailed results from JSON file
+            if result_json_file.exists():
+                try:
+                    with open(result_json_file, 'r') as f:
+                        result_data = json.load(f)
+                except json.JSONDecodeError:
+                    # If JSON parsing fails, try reading as text
+                    with open(result_json_file, 'r') as f:
+                        result_data = {"raw_output": f.read()}
+            
+            # Also capture stdout/stderr for debugging
+            result_data['stdout'] = result.stdout
+            result_data['stderr'] = result.stderr
+            result_data['returncode'] = result.returncode
+            
+            return status, elapsed, result_data
             
         except subprocess.TimeoutExpired:
-            return "timeout", self.timeout
+            return "timeout", self.timeout, {"error": "timeout"}
         except Exception as e:
             print(f"AutoExe error: {e}")
-            return "error", 0.0
+            return "error", 0.0, {"error": str(e)}
+    
+    def _parse_assignments_from_output(
+        self,
+        result_data: Dict[str, Any],
+        input_params: List[Tuple[str, str]]
+    ) -> Dict[str, str]:
+        """
+        Parse variable assignments from AutoExe's output.
+        
+        Looks for assignments in:
+        1. The JSON result data (queries/responses)
+        2. Stdout/stderr for patterns like "x = 5"
+        
+        Returns:
+            Dict mapping parameter names to their values
+        """
+        assignments = {}
+        param_names = [name for name, _ in input_params]
+        
+        # Combine all text output sources
+        text_sources = []
+        
+        # Check for queries and responses in JSON
+        if isinstance(result_data, dict):
+            # Look for query/response pairs
+            for key in ['queries', 'responses', 'query', 'response']:
+                if key in result_data:
+                    value = result_data[key]
+                    if isinstance(value, list):
+                        text_sources.extend(str(v) for v in value)
+                    else:
+                        text_sources.append(str(value))
+            
+            # Add stdout/stderr
+            if 'stdout' in result_data:
+                text_sources.append(result_data['stdout'])
+            if 'stderr' in result_data:
+                text_sources.append(result_data['stderr'])
+            if 'raw_output' in result_data:
+                text_sources.append(result_data['raw_output'])
+        
+        combined_text = '\n'.join(text_sources)
+        
+        # Parse assignments using multiple patterns
+        for param_name in param_names:
+            # Pattern 1: param = value (with various formats)
+            patterns = [
+                rf'{re.escape(param_name)}\s*=\s*([^\n,;]+)',  # Simple assignment
+                rf'\b{re.escape(param_name)}\s*:\s*([^\n,;]+)',  # Colon notation
+                rf'"{re.escape(param_name)}"\s*:\s*([^\n,]+)',  # JSON-style
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, combined_text)
+                if match:
+                    value = match.group(1).strip()
+                    # Clean up the value
+                    value = value.rstrip(',;')
+                    # Remove trailing comments
+                    if '#' in value:
+                        value = value.split('#')[0].strip()
+                    if '//' in value:
+                        value = value.split('//')[0].strip()
+                    if value:
+                        assignments[param_name] = value
+                        break
+        
+        return assignments
+    
+    def _get_safe_default(self, type_hint: str) -> str:
+        """Get a safe default value for a type hint."""
+        type_hint_lower = type_hint.lower().strip()
+        
+        if 'list[list[' in type_hint_lower:
+            return '[[0]]'
+        elif 'list[' in type_hint_lower:
+            return '[0]'
+        elif 'str' in type_hint_lower:
+            return '"a"'
+        elif 'bool' in type_hint_lower:
+            return 'True'
+        elif 'float' in type_hint_lower:
+            return '1.0'
+        elif 'int' in type_hint_lower:
+            return '1'
+        elif 'dict' in type_hint_lower:
+            return '{}'
+        elif 'optional' in type_hint_lower:
+            return 'None'
+        else:
+            return '0'
     
     def _generate_test_from_result(
         self,
         func_name: str,
         result_status: str,
-        constraint_vars: Dict[str, Any]
+        input_params: List[Tuple[str, str]],
+        assignments: Dict[str, str]
     ) -> str:
         """
         Generate a test case from AutoExe result.
         
-        This is a simplified version - real implementation would parse
-        AutoExe's output for concrete values.
+        Args:
+            func_name: Function name to test
+            result_status: AutoExe result status (sat/unsat/etc)
+            input_params: List of (param_name, type_hint) tuples
+            assignments: Parsed variable assignments from AutoExe
+        
+        Returns:
+            A Python test function string
         """
         if result_status in ["sat", "success"]:
-            # Generate test with placeholder values
-            # In real usage, these would come from AutoExe's model
-            return f'''def test_{func_name}():
+            # Build argument list
+            args = []
+            missing_params = []
+            
+            for param_name, type_hint in input_params:
+                if param_name in assignments:
+                    value = assignments[param_name]
+                    # Validate that the value looks reasonable
+                    try:
+                        # Simple validation - try to compile as expression
+                        compile(value, '<string>', 'eval')
+                        args.append(value)
+                    except SyntaxError:
+                        # Use safe default if value is malformed
+                        args.append(self._get_safe_default(type_hint))
+                        missing_params.append(f"{param_name} (malformed: {value[:20]})")
+                else:
+                    # Use safe default based on type hint
+                    args.append(self._get_safe_default(type_hint))
+                    missing_params.append(param_name)
+            
+            args_str = ', '.join(args)
+            
+            test_code = f'''def test_{func_name}():
     solution = Solution()
-    # Generated by AutoExe (status: {result_status})
-    # TODO: Extract actual values from AutoExe output
-    result = solution.{func_name}()
-    # Assertion placeholder
+    # Generated by AutoExe (status: {result_status})'''
+            
+            if assignments:
+                model_comment = ', '.join(f"{k}={v}" for k, v in list(assignments.items())[:5])
+                test_code += f'\n    # Parsed assignments: {model_comment}'
+            
+            if missing_params:
+                test_code += f'\n    # Using defaults for: {", ".join(missing_params[:5])}'
+            
+            test_code += f'''
+    result = solution.{func_name}({args_str})
 '''
+            return test_code
         else:
             return f'''def test_{func_name}():
     solution = Solution()
@@ -212,7 +377,12 @@ class AutoExeRunner:
         
         condition_paths = paths_data.get('sampled_condition_paths', [])
         
+        # Extract input parameters once for the task
+        from path_to_precondition import extract_function_inputs
+        input_params = extract_function_inputs(code, func_name)
+        
         generated_tests = []
+        debug_info = []
         
         for path_idx, condition_path in enumerate(condition_paths):
             # Create wrapper program for AutoExe
@@ -221,20 +391,33 @@ class AutoExeRunner:
             # Write to temp file
             source_file = temp_dir / f"task_{task_num}_path_{path_idx}.py"
             output_file = temp_dir / f"result_{task_num}_path_{path_idx}.txt"
+            result_json_file = temp_dir / f"result_{task_num}_path_{path_idx}.json"
             
             with open(source_file, 'w') as f:
                 f.write(wrapper.code)
             
-            # Run AutoExe
-            status, elapsed = self._run_autoexe(
-                source_file, temp_dir, output_file
+            # Run AutoExe with detailed output
+            status, elapsed, result_data = self._run_autoexe(
+                source_file, temp_dir, output_file, result_json_file
             )
             
-            # Generate test from result
+            # Parse assignments from AutoExe output
+            assignments = self._parse_assignments_from_output(result_data, input_params)
+            
+            # Generate test from result with parsed assignments
             test = self._generate_test_from_result(
-                func_name, status, {}
+                func_name, status, input_params, assignments
             )
             generated_tests.append(test)
+            
+            # Store debug info
+            debug_info.append({
+                'path_idx': path_idx,
+                'status': status,
+                'elapsed': elapsed,
+                'assignments': assignments,
+                'wrapper_code': wrapper.code[:1000] if wrapper.code else None,  # Truncate for storage
+            })
             
             print(f"  Path {path_idx + 1}/{len(condition_paths)}: {status} ({elapsed:.1f}s)")
         
@@ -244,7 +427,8 @@ class AutoExeRunner:
             'func_name': func_name,
             'difficulty': difficulty,
             'code': code,
-            'tests': generated_tests
+            'tests': generated_tests,
+            'debug': debug_info
         }
     
     def run_selected_tasks(
@@ -254,10 +438,18 @@ class AutoExeRunner:
     ) -> List[Dict[str, Any]]:
         """
         Run AutoExe on all selected tasks.
+        
+        Filters existing results to only include tasks in current selection,
+        preventing stale/mixed results from different selections.
         """
         # Load selection
         with open(SELECTED_TASKS_FILE, 'r') as f:
             selection = json.load(f)
+        
+        # Get valid task_nums for current selection
+        valid_task_nums = get_selected_task_nums(selection)
+        selection_hash = compute_selection_hash(selection)
+        print(f"Selection hash: {selection_hash}, valid tasks: {sorted(valid_task_nums)}")
         
         # Load datasets
         leetcode_data = read_jsonl(LEETCODE_DATA)
@@ -268,39 +460,66 @@ class AutoExeRunner:
         if output_path is None:
             output_path = RESULTS_DIR / get_output_filename(approach, self.model)
         
-        # Load existing progress
+        # Load existing progress, filtering to only include entries in current selection
         results = []
         completed_indices = set()
         
         if output_path.exists():
             existing = read_jsonl(output_path)
-            results = existing
-            completed_indices = {r['task_num'] for r in existing}
-            print(f"Resuming from {len(existing)} completed tasks")
+            original_count = len(existing)
+            
+            # Filter to only keep entries that are in the current selection
+            results = [r for r in existing if r.get('task_num') in valid_task_nums]
+            filtered_count = original_count - len(results)
+            
+            if filtered_count > 0:
+                print(f"Filtered out {filtered_count} entries not in current selection")
+            
+            completed_indices = {r['task_num'] for r in results}
+            print(f"Resuming from {len(results)} completed tasks (in current selection)")
+        
+        # Filter tasks to process (exclude already completed)
+        all_indices = selection['all_indices']
+        tasks_to_process = [
+            (leetcode_data[idx], paths_data[idx])
+            for idx in all_indices
+            if leetcode_data[idx]['task_num'] not in completed_indices
+        ]
+        
+        if not tasks_to_process:
+            print("All tasks already completed")
+            return results
+        
+        print(f"Processing {len(tasks_to_process)} tasks with {self.max_workers} workers")
+        
+        # Thread-safe progress saving
+        write_lock = threading.Lock()
         
         # Create temp directory
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             
-            # Process each selected task
-            all_indices = selection['all_indices']
+            def process_task(task_tuple):
+                task_data, task_paths = task_tuple
+                return self.run_task(task_data, task_paths, temp_path)
             
-            for idx in tqdm(all_indices, desc="AutoExe generation"):
-                task_data = leetcode_data[idx]
-                task_paths = paths_data[idx]
+            # Process tasks in parallel
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                futures = {
+                    executor.submit(process_task, task_tuple): task_tuple[0]['task_num']
+                    for task_tuple in tasks_to_process
+                }
                 
-                # Skip if already completed
-                if task_data['task_num'] in completed_indices:
-                    continue
-                
-                print(f"\nTask {task_data['task_num']}: {task_data['task_title']}")
-                
-                result = self.run_task(task_data, task_paths, temp_path)
-                results.append(result)
-                
-                # Save progress
-                if save_progress:
-                    write_jsonl(results, output_path)
+                for future in tqdm(as_completed(futures), total=len(futures), desc="AutoExe generation"):
+                    task_num = futures[future]
+                    try:
+                        result = future.result()
+                        with write_lock:
+                            results.append(result)
+                            if save_progress:
+                                write_jsonl(results, output_path)
+                    except Exception as e:
+                        print(f"\nTask {task_num} failed: {e}")
         
         # Final save
         write_jsonl(results, output_path)
@@ -321,9 +540,11 @@ class AutoExeLLMRunner:
     def __init__(
         self,
         model: str = DEFAULT_MODEL,
+        max_workers: int = 4,
         api_key: Optional[str] = None
     ):
         self.model = model
+        self.max_workers = max_workers
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self._client = None
     
@@ -391,7 +612,7 @@ def test_{func_name}():
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.0,
-                max_tokens=512
+                max_completion_tokens=512
             )
             return response.choices[0].message.content
         except Exception as e:
@@ -435,9 +656,14 @@ def test_{func_name}():
         output_path: Optional[Path] = None,
         save_progress: bool = True
     ) -> List[Dict[str, Any]]:
-        """Run on all selected tasks."""
+        """Run on all selected tasks with selection filtering."""
         with open(SELECTED_TASKS_FILE, 'r') as f:
             selection = json.load(f)
+        
+        # Get valid task_nums for current selection
+        valid_task_nums = get_selected_task_nums(selection)
+        selection_hash = compute_selection_hash(selection)
+        print(f"Selection hash: {selection_hash}, valid tasks: {sorted(valid_task_nums)}")
         
         leetcode_data = read_jsonl(LEETCODE_DATA)
         paths_data = read_jsonl(TARGET_PATHS_DATA)
@@ -445,30 +671,62 @@ def test_{func_name}():
         if output_path is None:
             output_path = RESULTS_DIR / get_output_filename("autoexe_llm", self.model)
         
+        # Load existing progress, filtering to only include entries in current selection
         results = []
         completed_indices = set()
         
         if output_path.exists():
             existing = read_jsonl(output_path)
-            results = existing
-            completed_indices = {r['task_num'] for r in existing}
+            original_count = len(existing)
+            
+            # Filter to only keep entries that are in the current selection
+            results = [r for r in existing if r.get('task_num') in valid_task_nums]
+            filtered_count = original_count - len(results)
+            
+            if filtered_count > 0:
+                print(f"Filtered out {filtered_count} entries not in current selection")
+            
+            completed_indices = {r['task_num'] for r in results}
+            print(f"Resuming from {len(results)} completed tasks (in current selection)")
         
+        # Filter tasks to process (exclude already completed)
         all_indices = selection['all_indices']
+        tasks_to_process = [
+            (leetcode_data[idx], paths_data[idx])
+            for idx in all_indices
+            if leetcode_data[idx]['task_num'] not in completed_indices
+        ]
         
-        for idx in tqdm(all_indices, desc="AutoExe LLM generation"):
-            task_data = leetcode_data[idx]
-            task_paths = paths_data[idx]
+        if not tasks_to_process:
+            print("All tasks already completed")
+            return results
+        
+        print(f"Processing {len(tasks_to_process)} tasks with {self.max_workers} workers")
+        
+        # Thread-safe progress saving
+        write_lock = threading.Lock()
+        
+        def process_task(task_tuple):
+            task_data, task_paths = task_tuple
+            return self.run_task(task_data, task_paths)
+        
+        # Process tasks in parallel
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = {
+                executor.submit(process_task, task_tuple): task_tuple[0]['task_num']
+                for task_tuple in tasks_to_process
+            }
             
-            if task_data['task_num'] in completed_indices:
-                continue
-            
-            print(f"\nTask {task_data['task_num']}: {task_data['task_title']}")
-            
-            result = self.run_task(task_data, task_paths)
-            results.append(result)
-            
-            if save_progress:
-                write_jsonl(results, output_path)
+            for future in tqdm(as_completed(futures), total=len(futures), desc="AutoExe LLM generation"):
+                task_num = futures[future]
+                try:
+                    result = future.result()
+                    with write_lock:
+                        results.append(result)
+                        if save_progress:
+                            write_jsonl(results, output_path)
+                except Exception as e:
+                    print(f"\nTask {task_num} failed: {e}")
         
         write_jsonl(results, output_path)
         print(f"\nResults saved to {output_path}")
@@ -487,6 +745,8 @@ def parse_args():
                         help="Use LLM-only mode (no AutoExe binary)")
     parser.add_argument("--timeout", type=int, default=120,
                         help="Timeout per execution (default: 120s)")
+    parser.add_argument("--max-workers", type=int, default=4,
+                        help="Max parallel workers (default: 4)")
     parser.add_argument("--output", type=Path, default=None,
                         help="Output file path")
     parser.add_argument("--dry-run", action="store_true",
@@ -511,12 +771,13 @@ def main():
         return
     
     if args.llm_mode:
-        runner = AutoExeLLMRunner(model=args.model)
+        runner = AutoExeLLMRunner(model=args.model, max_workers=args.max_workers)
     else:
         runner = AutoExeRunner(
             model=args.model,
             timeout=args.timeout,
-            use_baseline=args.baseline
+            use_baseline=args.baseline,
+            max_workers=args.max_workers
         )
     
     results = runner.run_selected_tasks(output_path=args.output)

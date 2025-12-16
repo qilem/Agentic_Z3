@@ -1,73 +1,42 @@
 {
   "seed": 42,
-  "medium_count": 15,
+  "medium_count": 0,
   "hard_count": 15,
-  "total_count": 30,
-  "medium_indices": [
-    7,
-    9,
-    24,
-    26,
-    27,
-    31,
-    50,
-    55,
-    62,
-    99,
-    141,
-    156,
-    169,
-    178,
-    199
-  ],
+  "total_count": 15,
+  "medium_indices": [],
   "hard_indices": [
     5,
+    8,
     20,
-    58,
-    65,
+    29,
+    33,
+    38,
     71,
-    74,
-    121,
-    127,
-    137,
+    77,
+    82,
+    122,
     146,
-    149,
-    162,
-    175,
-    185,
-    190
+    159,
+    172,
+    180,
+    194
   ],
   "all_indices": [
     5,
-    7,
-    9,
+    8,
     20,
-    24,
-    26,
-    27,
-    31,
-    50,
-    55,
-    58,
-    62,
-    65,
+    29,
+    33,
+    38,
     71,
-    74,
-    99,
-    121,
-    127,
-    137,
-    141,
+    77,
+    82,
+    122,
     146,
-    149,
-    156,
-    162,
-    169,
-    175,
-    178,
-    185,
-    190,
-    199
+    159,
+    172,
+    180,
+    194
   ],
   "tasks": [
     {
@@ -79,19 +48,11 @@
       "num_target_paths": 3
     },
     {
-      "index": 7,
-      "task_num": 97,
-      "task_title": "Interleaving String",
-      "difficulty": 2,
-      "func_name": "isInterleave",
-      "num_target_paths": 3
-    },
-    {
-      "index": 9,
-      "task_num": 130,
-      "task_title": "Surrounded Regions",
-      "difficulty": 2,
-      "func_name": "solve",
+      "index": 8,
+      "task_num": 126,
+      "task_title": "Word Ladder II",
+      "difficulty": 3,
+      "func_name": "findLadders",
       "num_target_paths": 3
     },
     {
@@ -103,76 +64,28 @@
       "num_target_paths": 4
     },
     {
-      "index": 24,
-      "task_num": 457,
-      "task_title": "Circular Array Loop",
-      "difficulty": 2,
-      "func_name": "circularArrayLoop",
-      "num_target_paths": 4
-    },
-    {
-      "index": 26,
-      "task_num": 542,
-      "task_title": "01 Matrix",
-      "difficulty": 2,
-      "func_name": "updateMatrix",
-      "num_target_paths": 4
-    },
-    {
-      "index": 27,
-      "task_num": 547,
-      "task_title": "Number of Provinces",
-      "difficulty": 2,
-      "func_name": "findCircleNum",
-      "num_target_paths": 4
-    },
-    {
-      "index": 31,
-      "task_num": 673,
-      "task_title": "Number of Longest Increasing Subsequence",
-      "difficulty": 2,
-      "func_name": "findNumberOfLIS",
-      "num_target_paths": 4
-    },
-    {
-      "index": 50,
-      "task_num": 845,
-      "task_title": "Longest Mountain in Array",
-      "difficulty": 2,
-      "func_name": "longestMountain",
+      "index": 29,
+      "task_num": 591,
+      "task_title": "Tag Validator",
+      "difficulty": 3,
+      "func_name": "isValid",
       "num_target_paths": 3
     },
     {
-      "index": 55,
-      "task_num": 909,
-      "task_title": "Snakes and Ladders",
-      "difficulty": 2,
-      "func_name": "snakesAndLadders",
+      "index": 33,
+      "task_num": 685,
+      "task_title": "Redundant Connection II",
+      "difficulty": 3,
+      "func_name": "findRedundantDirectedConnection",
       "num_target_paths": 4
     },
     {
-      "index": 58,
-      "task_num": 927,
-      "task_title": "Three Equal Parts",
+      "index": 38,
+      "task_num": 730,
+      "task_title": "Count Different Palindromic Subsequences",
       "difficulty": 3,
-      "func_name": "threeEqualParts",
+      "func_name": "countPalindromicSubsequences",
       "num_target_paths": 4
-    },
-    {
-      "index": 62,
-      "task_num": 963,
-      "task_title": "Minimum Area Rectangle II",
-      "difficulty": 2,
-      "func_name": "minAreaFreeRect",
-      "num_target_paths": 6
-    },
-    {
-      "index": 65,
-      "task_num": 1001,
-      "task_title": "Grid Illumination",
-      "difficulty": 3,
-      "func_name": "gridIllumination",
-      "num_target_paths": 6
     },
     {
       "index": 71,
@@ -183,52 +96,28 @@
       "num_target_paths": 4
     },
     {
-      "index": 74,
-      "task_num": 1263,
-      "task_title": "Minimum Moves to Move a Box to Their Target Location",
+      "index": 77,
+      "task_num": 1293,
+      "task_title": "Shortest Path in a Grid with Obstacles Elimination",
       "difficulty": 3,
-      "func_name": "minPushBox",
-      "num_target_paths": 2
-    },
-    {
-      "index": 99,
-      "task_num": 1654,
-      "task_title": "Minimum Jumps to Reach Home",
-      "difficulty": 2,
-      "func_name": "minimumJumps",
-      "num_target_paths": 6
-    },
-    {
-      "index": 121,
-      "task_num": 1928,
-      "task_title": "Minimum Cost to Reach Destination in Time",
-      "difficulty": 3,
-      "func_name": "minCost",
-      "num_target_paths": 6
-    },
-    {
-      "index": 127,
-      "task_num": 1998,
-      "task_title": "GCD Sort of an Array",
-      "difficulty": 3,
-      "func_name": "gcdSort",
-      "num_target_paths": 6
-    },
-    {
-      "index": 137,
-      "task_num": 2127,
-      "task_title": "Maximum Employees to Be Invited to a Meeting",
-      "difficulty": 3,
-      "func_name": "maximumInvitations",
-      "num_target_paths": 5
-    },
-    {
-      "index": 141,
-      "task_num": 2182,
-      "task_title": "Construct String With Repeat Limit",
-      "difficulty": 2,
-      "func_name": "repeatLimitedString",
+      "func_name": "shortestPath",
       "num_target_paths": 4
+    },
+    {
+      "index": 82,
+      "task_num": 1377,
+      "task_title": "Frog Position After T Seconds",
+      "difficulty": 3,
+      "func_name": "frogPosition",
+      "num_target_paths": 4
+    },
+    {
+      "index": 122,
+      "task_num": 1938,
+      "task_title": "Maximum Genetic Difference Query",
+      "difficulty": 3,
+      "func_name": "maxGeneticDifference",
+      "num_target_paths": 3
     },
     {
       "index": 146,
@@ -239,76 +128,36 @@
       "num_target_paths": 6
     },
     {
-      "index": 149,
-      "task_num": 2301,
-      "task_title": "Match Substring After Replacement",
+      "index": 159,
+      "task_num": 2503,
+      "task_title": "Maximum Number of Points From Grid Queries",
       "difficulty": 3,
-      "func_name": "matchReplacement",
-      "num_target_paths": 5
-    },
-    {
-      "index": 156,
-      "task_num": 2462,
-      "task_title": "Total Cost to Hire K Workers",
-      "difficulty": 2,
-      "func_name": "totalCost",
-      "num_target_paths": 4
-    },
-    {
-      "index": 162,
-      "task_num": 2532,
-      "task_title": "Time to Cross a Bridge",
-      "difficulty": 3,
-      "func_name": "findCrossingTime",
-      "num_target_paths": 2
-    },
-    {
-      "index": 169,
-      "task_num": 2672,
-      "task_title": "Number of Adjacent Elements With the Same Color",
-      "difficulty": 2,
-      "func_name": "colorTheArray",
+      "func_name": "maxPoints",
       "num_target_paths": 3
     },
     {
-      "index": 175,
-      "task_num": 2736,
-      "task_title": "Maximum Sum Queries",
+      "index": 172,
+      "task_num": 2699,
+      "task_title": "Modify Graph Edge Weights",
       "difficulty": 3,
-      "func_name": "maximumSumQueries",
-      "num_target_paths": 5
-    },
-    {
-      "index": 178,
-      "task_num": 2812,
-      "task_title": "Find the Safest Path in a Grid",
-      "difficulty": 2,
-      "func_name": "maximumSafenessFactor",
+      "func_name": "modifiedGraphEdges",
       "num_target_paths": 6
     },
     {
-      "index": 185,
-      "task_num": 2876,
-      "task_title": "Count Visited Nodes in a Directed Graph",
+      "index": 180,
+      "task_num": 2836,
+      "task_title": "Maximize Value of Function in a Ball Passing Game",
       "difficulty": 3,
-      "func_name": "countVisitedNodes",
+      "func_name": "getMaxFunctionValue",
       "num_target_paths": 4
     },
     {
-      "index": 190,
-      "task_num": 2940,
-      "task_title": "Find Building Where Alice and Bob Can Meet",
+      "index": 194,
+      "task_num": 2973,
+      "task_title": "Find Number of Coins to Place in Tree Nodes",
       "difficulty": 3,
-      "func_name": "leftmostBuildingQueries",
-      "num_target_paths": 4
-    },
-    {
-      "index": 199,
-      "task_num": 3006,
-      "task_title": "Find Beautiful Indices in the Given Array I",
-      "difficulty": 2,
-      "func_name": "beautifulIndices",
-      "num_target_paths": 3
+      "func_name": "placedCoins",
+      "num_target_paths": 1
     }
   ]
 }

@@ -97,10 +97,10 @@ def run_autoexe(model: str = DEFAULT_MODEL, use_llm_mode: bool = True):
         return False
 
 
-def run_agentic_z3(model: str = DEFAULT_MODEL, mode: str = 'llm'):
+def run_agentic_z3(model: str = DEFAULT_MODEL, mode: str = 'engine', temperature: float = 0.0):
     """Run Agentic-Z3 approach."""
     print("\n" + "=" * 60)
-    print("Running Agentic-Z3")
+    print(f"Running Agentic-Z3 (mode={mode})")
     print("=" * 60)
     
     from runners.agentic_z3_runner import AgenticZ3Runner, AgenticZ3LLMRunner
@@ -111,7 +111,8 @@ def run_agentic_z3(model: str = DEFAULT_MODEL, mode: str = 'llm'):
         else:
             runner = AgenticZ3Runner(
                 model=model,
-                use_engine=(mode == 'engine')
+                use_engine=(mode == 'engine'),
+                temperature=temperature
             )
         
         results = runner.run_selected_tasks()
@@ -119,6 +120,26 @@ def run_agentic_z3(model: str = DEFAULT_MODEL, mode: str = 'llm'):
         return True
     except Exception as e:
         print(f"Agentic-Z3 failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def run_vanilla_z3(model: str = DEFAULT_MODEL):
+    """Run Vanilla Z3 baseline."""
+    print("\n" + "=" * 60)
+    print("Running Vanilla Z3 Baseline")
+    print("=" * 60)
+    
+    from runners.vanilla_z3_runner import VanillaZ3Runner
+    
+    try:
+        runner = VanillaZ3Runner(model=model)
+        results = runner.run_selected_tasks()
+        print(f"Vanilla Z3 completed: {len(results)} tasks")
+        return True
+    except Exception as e:
+        print(f"Vanilla Z3 failed: {e}")
         return False
 
 
@@ -172,8 +193,9 @@ def print_banner():
 ║    1. Zero-Shot Baseline (Direct LLM prompting)              ║
 ║    2. AutoExe (LLM-powered symbolic execution)               ║
 ║    3. Agentic-Z3 (SMT constraint solving)                    ║
+║    4. Vanilla Z3 (Single Text-to-Z3 prompt + execute)        ║
 ║                                                               ║
-║  Dataset: 15 Medium + 15 Hard tasks from TestEval            ║
+║  Dataset: 15 Hard tasks from TestEval                        ║
 ╚══════════════════════════════════════════════════════════════╝
 """)
 
@@ -225,7 +247,7 @@ Examples:
     parser.add_argument("--all", action="store_true",
                         help="Run complete pipeline (all approaches + evaluation)")
     parser.add_argument("--run", nargs="+", 
-                        choices=["zero_shot", "autoexe", "agentic_z3"],
+                        choices=["zero_shot", "autoexe", "agentic_z3", "vanilla_z3"],
                         help="Run specific approaches")
     parser.add_argument("--evaluate", action="store_true",
                         help="Run evaluation on existing results")
@@ -236,9 +258,12 @@ Examples:
     parser.add_argument("--model", type=str, default=DEFAULT_MODEL,
                         help=f"LLM model to use (default: {DEFAULT_MODEL})")
     parser.add_argument("--llm-mode", action="store_true", default=True,
-                        help="Use LLM-based runners (default)")
+                        help="Use LLM-based runners for AutoExe (default)")
     parser.add_argument("--no-llm-mode", action="store_false", dest="llm_mode",
-                        help="Use non-LLM runners where available")
+                        help="Use non-LLM runners for AutoExe where available")
+    parser.add_argument("--agentic-mode", type=str, default="engine",
+                        choices=["engine", "direct", "llm"],
+                        help="Agentic-Z3 mode: 'engine' (full multi-agent), 'direct' (Z3 only), 'llm' (LLM prompting)")
     
     return parser.parse_args()
 
@@ -271,7 +296,9 @@ def main():
             elif approach == "autoexe":
                 run_autoexe(model=args.model, use_llm_mode=args.llm_mode)
             elif approach == "agentic_z3":
-                run_agentic_z3(model=args.model, mode='llm' if args.llm_mode else 'direct')
+                run_agentic_z3(model=args.model, mode=args.agentic_mode)
+            elif approach == "vanilla_z3":
+                run_vanilla_z3(model=args.model)
         
         if args.evaluate or args.all:
             run_evaluation()
@@ -291,7 +318,8 @@ def main():
         success = {
             "zero_shot": run_zero_shot(model=args.model),
             "autoexe": run_autoexe(model=args.model, use_llm_mode=args.llm_mode),
-            "agentic_z3": run_agentic_z3(model=args.model, mode='llm' if args.llm_mode else 'direct'),
+            "agentic_z3": run_agentic_z3(model=args.model, mode=args.agentic_mode),
+            "vanilla_z3": run_vanilla_z3(model=args.model),
         }
         
         print("\n" + "=" * 60)
@@ -313,3 +341,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

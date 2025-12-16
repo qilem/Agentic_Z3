@@ -23,8 +23,9 @@ import shutil
 import time
 from pathlib import Path
 from argparse import ArgumentParser
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Set
 from dataclasses import dataclass, field
+from collections import Counter
 from tqdm import tqdm
 
 # Add benchmark directory to path
@@ -43,6 +44,24 @@ LEETCODE_INSTRUMENTED = benchmark_config.LEETCODE_INSTRUMENTED
 TARGET_PATHS_DATA = benchmark_config.TARGET_PATHS_DATA
 RESULTS_DIR = benchmark_config.RESULTS_DIR
 EXECUTION_TIMEOUT = benchmark_config.EXECUTION_TIMEOUT
+SELECTED_TASKS_FILE = benchmark_config.SELECTED_TASKS_FILE
+
+
+def load_selected_task_nums() -> Set[int]:
+    """Load task_nums from the selected_tasks.json file."""
+    if not SELECTED_TASKS_FILE.exists():
+        return set()
+    try:
+        with open(SELECTED_TASKS_FILE, 'r') as f:
+            data = json.load(f)
+        task_nums = set()
+        for task in data.get('tasks', []):
+            if 'task_num' in task:
+                task_nums.add(task['task_num'])
+        return task_nums
+    except Exception as e:
+        print(f"Warning: Could not load selected tasks: {e}")
+        return set()
 
 
 def read_jsonl(path: Path) -> List[Dict[str, Any]]:
@@ -82,6 +101,19 @@ def execute_test(test_code: str, timeout: int = EXECUTION_TIMEOUT) -> Tuple[bool
     Returns:
         Tuple of (success, error_message)
     """
+    # Clear module cache to ensure fresh import of under_test
+    # This is necessary because each task has its own under_test.py
+    if 'under_test' in sys.modules:
+        del sys.modules['under_test']
+    
+    # Add current directory to sys.path for import to work
+    # This is needed because os.chdir() changes cwd but doesn't update sys.path
+    cwd = os.getcwd()
+    path_added = False
+    if cwd not in sys.path:
+        sys.path.insert(0, cwd)
+        path_added = True
+    
     try:
         with TimeoutHandler(timeout):
             exec(test_code, globals())
@@ -93,6 +125,10 @@ def execute_test(test_code: str, timeout: int = EXECUTION_TIMEOUT) -> Tuple[bool
         return False, "timeout"
     except Exception as e:
         return False, f"{type(e).__name__}: {str(e)[:100]}"
+    finally:
+        # Remove the path we added to avoid polluting sys.path
+        if path_added and cwd in sys.path:
+            sys.path.remove(cwd)
 
 
 def match_path(generated_path: List[str], ref_path: List[str]) -> float:
@@ -199,14 +235,31 @@ class Evaluator:
     def __init__(
         self,
         instrumented_data_path: Path = LEETCODE_INSTRUMENTED,
-        paths_data_path: Path = TARGET_PATHS_DATA
+        paths_data_path: Path = TARGET_PATHS_DATA,
+        filter_to_selection: bool = True
     ):
-        """Initialize evaluator with reference data."""
+        """Initialize evaluator with reference data.
+        
+        Args:
+            instrumented_data_path: Path to instrumented code JSONL
+            paths_data_path: Path to target paths JSONL
+            filter_to_selection: If True, only evaluate tasks in selected_tasks.json
+        """
         print(f"Loading instrumented code from {instrumented_data_path}")
         self.instrumented_data = read_jsonl(instrumented_data_path)
         
         print(f"Loading target paths from {paths_data_path}")
         self.paths_data = read_jsonl(paths_data_path)
+        
+        # Load selected tasks for filtering
+        self.filter_to_selection = filter_to_selection
+        self.selected_task_nums: Set[int] = set()
+        if filter_to_selection:
+            self.selected_task_nums = load_selected_task_nums()
+            if self.selected_task_nums:
+                print(f"Filtering to {len(self.selected_task_nums)} selected tasks: {sorted(self.selected_task_nums)}")
+            else:
+                print("Warning: No selected tasks found, will evaluate all tasks")
         
         # Build index by task_num
         self.task_index = {}
@@ -237,6 +290,25 @@ class Evaluator:
         print(f"\nEvaluating {approach_name} from {predictions_path}")
         
         predictions = read_jsonl(predictions_path)
+        
+        # Filter to selected tasks if enabled
+        if self.filter_to_selection and self.selected_task_nums:
+            original_count = len(predictions)
+            predictions = [p for p in predictions if p.get('task_num') in self.selected_task_nums]
+            if len(predictions) < original_count:
+                print(f"  Filtered: {original_count} -> {len(predictions)} predictions (selected tasks only)")
+        
+        # Handle duplicate task_num entries: keep the LAST entry for each task_num
+        # This handles resume scenarios where tasks might be re-run
+        seen_keys = {}  # task_num -> prediction entry
+        for pred in predictions:
+            task_num = pred.get('task_num')
+            # Keep overwriting, so last entry wins
+            seen_keys[task_num] = pred
+        
+        predictions = list(seen_keys.values())
+        print(f"  After deduplication: {len(predictions)} unique tasks")
+        
         result = EvaluationResult(approach=approach_name)
         result.total_tasks = len(predictions)
         
@@ -278,8 +350,8 @@ class Evaluator:
                 for path_idx, test_code in enumerate(tests):
                     result.total_paths += 1
                     
-                    # Clear log file
-                    log_file = log_dir / f"{task_title}.log"
+                    # Clear log file (use absolute path to work correctly after chdir)
+                    log_file = (log_dir / f"{task_title}.log").resolve()
                     log_file.write_text('')
                     
                     # Extract test function
@@ -317,13 +389,24 @@ class Evaluator:
                         success, error = execute_test(full_test)
                         
                         if success:
-                            # Check if function was actually called
-                            if f"solution.{func_name}" in full_test or f"Solution().{func_name}" in clean_test:
+                            # Check if function was actually called using robust regex
+                            # Match patterns like: .func_name(, Solution().func_name(, solution.func_name(
+                            func_call_pattern = rf'\.{re.escape(func_name)}\s*\('
+                            solution_instantiation = rf'Solution\s*\(\s*\)\s*\.{re.escape(func_name)}\s*\('
+                            
+                            code_to_check = full_test + "\n" + clean_test
+                            func_called = (
+                                re.search(func_call_pattern, code_to_check) is not None or
+                                re.search(solution_instantiation, code_to_check) is not None
+                            )
+                            
+                            if func_called:
                                 result.execution_correct += 1
                                 
                                 # Check path coverage
                                 if path_idx < len(sampled_paths):
-                                    ref_path = sampled_paths[path_idx]
+                                    # Normalize by stripping trailing newlines from reference paths
+                                    ref_path = [p.rstrip('\n') for p in sampled_paths[path_idx]]
                                     
                                     # Read executed path from log
                                     if log_file.exists():
@@ -387,7 +470,29 @@ class Evaluator:
         return results
     
     @staticmethod
-    def print_comparison(results: Dict[str, EvaluationResult]):
+    def print_error_histogram(result: EvaluationResult, top_n: int = 10):
+        """Print histogram of error types for a single result."""
+        if not result.errors:
+            print(f"  No errors recorded for {result.approach}")
+            return
+        
+        # Count error types
+        error_counter = Counter()
+        for err in result.errors:
+            error_type = err.get('error', 'unknown')
+            # Normalize error messages (truncate long runtime errors)
+            if ':' in error_type and len(error_type) > 50:
+                # Keep just the exception type
+                error_type = error_type.split(':')[0]
+            error_counter[error_type] += 1
+        
+        print(f"\n  Top {top_n} errors for {result.approach} ({len(result.errors)} total):")
+        for error_type, count in error_counter.most_common(top_n):
+            pct = count / result.total_paths * 100 if result.total_paths > 0 else 0
+            print(f"    {count:4d} ({pct:5.1f}%) - {error_type}")
+    
+    @staticmethod
+    def print_comparison(results: Dict[str, EvaluationResult], show_errors: bool = True):
         """Print comparison table of all approaches."""
         if not results:
             print("No results to compare")
@@ -398,14 +503,14 @@ class Evaluator:
         print("=" * 80)
         
         # Header
-        header = f"{'Approach':<20} {'Syntax':<10} {'Exec':<10} {'Exact':<10} {'Similarity':<12}"
+        header = f"{'Approach':<30} {'Syntax':<10} {'Exec':<10} {'Exact':<10} {'Similarity':<12}"
         print(header)
         print("-" * 80)
         
         # Results
         for name, result in sorted(results.items()):
             row = (
-                f"{name:<20} "
+                f"{name:<30} "
                 f"{result.syntax_rate:>8.1%}  "
                 f"{result.execution_rate:>8.1%}  "
                 f"{result.exact_match_rate:>8.1%}  "
@@ -421,6 +526,14 @@ class Evaluator:
         print("  Exec: Percentage of successfully executable test cases")
         print("  Exact: Percentage of tests that exactly match target path")
         print("  Similarity: Average path similarity score (0-1, LCS-based)")
+        
+        # Error histograms
+        if show_errors:
+            print("\n" + "=" * 80)
+            print("ERROR HISTOGRAMS")
+            print("=" * 80)
+            for name, result in sorted(results.items()):
+                Evaluator.print_error_histogram(result)
 
 
 def parse_args():
@@ -434,6 +547,10 @@ def parse_args():
                         help="Output JSON file for results")
     parser.add_argument("--list", action="store_true",
                         help="List available result files")
+    parser.add_argument("--no-filter", action="store_true",
+                        help="Disable filtering to selected_tasks.json (evaluate all tasks in file)")
+    parser.add_argument("--no-errors", action="store_true",
+                        help="Disable printing error histograms")
     return parser.parse_args()
 
 
@@ -478,12 +595,14 @@ def main():
     for name, path in approaches.items():
         print(f"  - {name}: {path}")
     
-    # Run evaluation
-    evaluator = Evaluator()
+    # Run evaluation with optional filtering
+    filter_to_selection = not args.no_filter
+    evaluator = Evaluator(filter_to_selection=filter_to_selection)
     results = evaluator.evaluate_all(approaches)
     
-    # Print comparison
-    Evaluator.print_comparison(results)
+    # Print comparison with optional error histograms
+    show_errors = not args.no_errors
+    Evaluator.print_comparison(results, show_errors=show_errors)
     
     # Save results if requested
     if args.output:

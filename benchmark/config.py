@@ -32,8 +32,8 @@ RESULTS_DIR = BENCHMARK_ROOT / "results"
 SELECTED_TASKS_FILE = BENCHMARK_ROOT / "selected_tasks.json"
 
 # Task selection configuration
-NUM_MEDIUM_TASKS = 15  # difficulty == 2
-NUM_HARD_TASKS = 15    # difficulty == 3
+NUM_MEDIUM_TASKS = 0   # difficulty == 2 (disabled by default)
+NUM_HARD_TASKS = 15    # difficulty == 3 (hard-only benchmark)
 RANDOM_SEED = 42
 
 # Difficulty mapping (LeetCode style)
@@ -42,7 +42,7 @@ DIFFICULTY_MEDIUM = 2
 DIFFICULTY_HARD = 3
 
 # LLM Configuration
-DEFAULT_MODEL = "gpt-4o"
+DEFAULT_MODEL = "gpt-5.2"
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_MAX_TOKENS = 512
 
@@ -62,3 +62,5 @@ def get_output_filename(approach: str, model: str = DEFAULT_MODEL) -> str:
 
 # Ensure results directory exists
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
