@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     # ==========================================================================
     
     OPENAI_API_KEY: Optional[str] = Field(
-        default='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',
+        default='',
         description="OpenAI API key. Required for LLM-based agents. Set via OPENAI_API_KEY env var or .env file."
     )
     
